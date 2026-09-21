@@ -1737,4 +1737,243 @@ mod tests {
         assert!(recovered.contains(&parent_operation));
     }
 
+
+    fn cp14_read_records(path: &Path) -> Vec<JournalRecord> {
+        std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<JournalRecord>(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn hash_chain_links_records_and_witness_matches_head() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("cp14-session".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let gate =
+            DurableEgressPermitGate::new("sandbox-a", Arc::clone(&authority), &journal).unwrap();
+
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+
+        let records = cp14_read_records(&journal);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].sequence, 1);
+        assert_eq!(records[0].prev_record_sha256, GENESIS_HASH);
+        assert_eq!(records[1].sequence, 2);
+        assert_eq!(
+            records[1].prev_record_sha256,
+            records[0].journal_record_sha256
+        );
+
+        let witness = read_high_water_witness(gate.store.witness_path()).unwrap();
+        assert_eq!(witness.sequence, 2);
+        assert_eq!(
+            witness.head_record_sha256,
+            records[1].journal_record_sha256
+        );
+    }
+
+    #[tokio::test]
+    async fn preserved_witness_detects_deleted_valid_tail_record() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("cp14-session".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let gate =
+            DurableEgressPermitGate::new("sandbox-a", Arc::clone(&authority), &journal).unwrap();
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+        let records = cp14_read_records(&journal);
+        let first_line = serde_json::to_string(&records[0]).unwrap() + "\n";
+        drop(gate);
+
+        std::fs::write(&journal, first_line).unwrap();
+
+        let reopened =
+            DurableEgressPermitGate::new("sandbox-b", Arc::clone(&authority), &journal);
+        assert!(
+            reopened.is_err(),
+            "preserved high-water witness must detect deletion of a valid journal tail"
+        );
+    }
+
+    #[tokio::test]
+    async fn hash_chain_detects_deleted_middle_record() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("cp14-session".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let gate =
+            DurableEgressPermitGate::new("sandbox-a", Arc::clone(&authority), &journal).unwrap();
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+        let records = cp14_read_records(&journal);
+        drop(gate);
+
+        let forged_prefix = format!(
+            "{}\n{}\n",
+            serde_json::to_string(&records[0]).unwrap(),
+            serde_json::to_string(&records[2]).unwrap()
+        );
+        std::fs::write(&journal, forged_prefix).unwrap();
+
+        let reopened =
+            DurableEgressPermitGate::new("sandbox-b", Arc::clone(&authority), &journal);
+        assert!(
+            reopened.is_err(),
+            "sequence/hash-chain validation must detect a deleted interior record"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_witness_for_existing_journal_fails_closed() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("cp14-session".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let witness = witness_path_for(&journal);
+        let gate =
+            DurableEgressPermitGate::new("sandbox-a", Arc::clone(&authority), &journal).unwrap();
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+        drop(gate);
+
+        std::fs::remove_file(&witness).unwrap();
+
+        let reopened =
+            DurableEgressPermitGate::new("sandbox-b", Arc::clone(&authority), &journal);
+        assert!(reopened.is_err());
+    }
+
+    #[tokio::test]
+    async fn corrupt_witness_commitment_fails_closed() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("cp14-session".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let witness_path = witness_path_for(&journal);
+        let gate =
+            DurableEgressPermitGate::new("sandbox-a", Arc::clone(&authority), &journal).unwrap();
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+        drop(gate);
+
+        let mut witness = read_high_water_witness(&witness_path).unwrap();
+        witness.head_record_sha256 = GENESIS_HASH.to_string();
+        std::fs::write(
+            &witness_path,
+            serde_json::to_vec(&witness).unwrap(),
+        )
+        .unwrap();
+
+        let reopened =
+            DurableEgressPermitGate::new("sandbox-b", Arc::clone(&authority), &journal);
+        assert!(reopened.is_err());
+    }
+
+    #[tokio::test]
+    async fn valid_journal_ahead_of_witness_fast_forwards_witness() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("cp14-session".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let witness_path = witness_path_for(&journal);
+        let gate =
+            DurableEgressPermitGate::new("sandbox-a", Arc::clone(&authority), &journal).unwrap();
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+        let records = cp14_read_records(&journal);
+        drop(gate);
+
+        let older_head = JournalHead {
+            sequence: records[0].sequence,
+            record_sha256: records[0].journal_record_sha256.clone(),
+        };
+        write_high_water_witness(&witness_path, &older_head).unwrap();
+
+        let reopened =
+            DurableEgressPermitGate::new("sandbox-b", Arc::clone(&authority), &journal)
+                .expect("valid journal extension beyond witness should reconcile forward");
+        drop(reopened);
+
+        let witness = read_high_water_witness(&witness_path).unwrap();
+        assert_eq!(witness.sequence, records[1].sequence);
+        assert_eq!(
+            witness.head_record_sha256,
+            records[1].journal_record_sha256
+        );
+    }
+
+    #[tokio::test]
+    async fn separately_configured_witness_path_detects_journal_rollback() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("cp14-session".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("journal").join("permits.jsonl");
+        let witness = dir.path().join("witness-store").join("head.json");
+
+        let gate = DurableEgressPermitGate::new_with_witness(
+            "sandbox-a",
+            Arc::clone(&authority),
+            &journal,
+            &witness,
+        )
+        .unwrap();
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+        gate.commit_before_effect(&guard, test_input()).await.unwrap();
+        let records = cp14_read_records(&journal);
+        drop(gate);
+
+        std::fs::write(
+            &journal,
+            serde_json::to_string(&records[0]).unwrap() + "\n",
+        )
+        .unwrap();
+
+        let reopened = DurableEgressPermitGate::new_with_witness(
+            "sandbox-b",
+            Arc::clone(&authority),
+            &journal,
+            &witness,
+        );
+        assert!(reopened.is_err());
+    }
+
 }
