@@ -3,6 +3,8 @@ name: CP10 OpenShell compile
 on:
   push:
     branches: [cp10-openshell-ci]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
