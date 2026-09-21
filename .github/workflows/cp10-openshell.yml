@@ -48,3 +48,20 @@ jobs:
       - name: CP10 Rust unit tests
         working-directory: upstream
         run: cargo +1.95.0 test -p openshell-supervisor-network durable_egress --lib -- --nocapture
+
+      - name: Export exact verified CP10 artifact
+        run: |
+          git -C upstream diff --binary > openshell_cp10/CP10_OPENSHELL_PINNED.patch
+          {
+            echo "openshell_commit=$(git -C upstream rev-parse HEAD)"
+            echo "harness_commit=$GITHUB_SHA"
+            rustc +1.95.0 --version
+            cargo +1.95.0 --version
+          } > openshell_cp10/CP10_COMPILE_EVIDENCE.txt
+
+      - name: Upload CP10 verified artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackbox-cp10-openshell-verified
+          path: openshell_cp10/
+          if-no-files-found: error
