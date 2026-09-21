@@ -7,11 +7,13 @@ use miette::{IntoDiagnostic, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::fs::{File, OpenOptions};
-use std::io::{self, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use uuid::Uuid;
 
 pub const JOURNAL_ENV: &str = "OPENSHELL_BLACKBOX_EGRESS_JOURNAL";
@@ -142,44 +144,254 @@ pub fn publish_supervisor_session(session: Option<String>) {
     GLOBAL_DISPATCH_FENCE.publish_session(session);
 }
 
+#[cfg(unix)]
+fn file_lock_exclusive(file: &File) -> io::Result<()> {
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(unix)]
+fn file_lock_release(file: &File) -> io::Result<()> {
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_UN) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(unix))]
+fn file_lock_exclusive(_file: &File) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "BLACKBOX cross-process writer fencing requires a Unix flock-capable platform",
+    ))
+}
+
+#[cfg(not(unix))]
+fn file_lock_release(_file: &File) -> io::Result<()> {
+    Ok(())
+}
+
+fn sync_parent_directory(parent: &Path) -> io::Result<()> {
+    let directory = File::open(parent)?;
+    directory.sync_all()
+}
+
+fn lock_path_for(journal: &Path) -> PathBuf {
+    let mut value = journal.as_os_str().to_os_string();
+    value.push(".lock");
+    PathBuf::from(value)
+}
+
+fn read_writer_token(file: &mut File) -> io::Result<String> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut value = String::new();
+    file.read_to_string(&mut value)?;
+    let token = value.trim();
+    if token.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "BLACKBOX writer fence token is empty",
+        ));
+    }
+    Ok(token.to_string())
+}
+
+fn validate_permit_record(permit: &DurableEgressPermit) -> io::Result<()> {
+    if permit.schema != "blackbox.openshell.durable-egress-permit.v2" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "BLACKBOX journal contains an unsupported permit schema",
+        ));
+    }
+
+    let intent = serde_json::json!({
+        "surface": permit.surface,
+        "host": permit.host,
+        "port": permit.port,
+        "matched_policy": permit.matched_policy,
+        "binary_path": permit.binary_path,
+        "binary_pid": permit.binary_pid,
+    });
+    let intent_sha256 = sha256_hex(&serde_json::to_vec(&intent).map_err(io::Error::other)?);
+    if intent_sha256 != permit.intent_sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "BLACKBOX journal intent commitment mismatch",
+        ));
+    }
+
+    let record = serde_json::json!({
+        "schema": permit.schema,
+        "operation_id": permit.operation_id,
+        "sandbox_id": permit.sandbox_id,
+        "supervisor_session_id": permit.supervisor_session_id,
+        "supervisor_session_epoch": permit.supervisor_session_epoch,
+        "policy_generation": permit.policy_generation,
+        "surface": permit.surface,
+        "host": permit.host,
+        "port": permit.port,
+        "matched_policy": permit.matched_policy,
+        "binary_path": permit.binary_path,
+        "binary_pid": permit.binary_pid,
+        "intent_sha256": permit.intent_sha256,
+        "committed_unix_ns": permit.committed_unix_ns,
+    });
+    let record_sha256 = sha256_hex(&serde_json::to_vec(&record).map_err(io::Error::other)?);
+    if record_sha256 != permit.record_sha256 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "BLACKBOX journal record commitment mismatch",
+        ));
+    }
+    Ok(())
+}
+
+fn recover_and_validate_journal(file: &mut File) -> io::Result<()> {
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)?;
+
+    let valid_len = if bytes.ends_with(b"\n") {
+        bytes.len()
+    } else {
+        bytes.iter()
+            .rposition(|byte| *byte == b'\n')
+            .map_or(0, |position| position + 1)
+    };
+
+    let mut start = 0usize;
+    while start < valid_len {
+        let relative_end = bytes[start..valid_len]
+            .iter()
+            .position(|byte| *byte == b'\n')
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "BLACKBOX journal framing error"))?;
+        let end = start + relative_end;
+        if end == start {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BLACKBOX journal contains an empty interior record",
+            ));
+        }
+        let permit: DurableEgressPermit =
+            serde_json::from_slice(&bytes[start..end]).map_err(io::Error::other)?;
+        validate_permit_record(&permit)?;
+        start = end + 1;
+    }
+
+    if valid_len < bytes.len() {
+        file.set_len(u64::try_from(valid_len).map_err(io::Error::other)?)?;
+        file.sync_all()?;
+    }
+    file.seek(SeekFrom::End(0))?;
+    Ok(())
+}
+
 #[derive(Debug)]
 struct PermitStore {
     path: PathBuf,
     file: Mutex<File>,
+    fence_file: Mutex<File>,
+    writer_token: String,
 }
 
 impl PermitStore {
     fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let file = OpenOptions::new()
+        let parent = path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent)?;
+
+        let lock_path = lock_path_for(&path);
+        let journal_existed = path.exists();
+        let lock_existed = lock_path.exists();
+
+        let mut fence_file = OpenOptions::new()
             .create(true)
-            .append(true)
             .read(true)
-            .open(&path)?;
+            .write(true)
+            .open(&lock_path)?;
+        file_lock_exclusive(&fence_file)?;
+
+        let writer_token = Uuid::new_v4().to_string();
+        let setup_result = (|| -> io::Result<File> {
+            fence_file.set_len(0)?;
+            fence_file.seek(SeekFrom::Start(0))?;
+            fence_file.write_all(writer_token.as_bytes())?;
+            fence_file.write_all(b"\n")?;
+            fence_file.sync_all()?;
+
+            let mut journal = OpenOptions::new()
+                .create(true)
+                .append(true)
+                .read(true)
+                .write(true)
+                .open(&path)?;
+            recover_and_validate_journal(&mut journal)?;
+
+            if !journal_existed || !lock_existed {
+                sync_parent_directory(parent)?;
+            }
+            Ok(journal)
+        })();
+
+        let unlock_result = file_lock_release(&fence_file);
+        let file = setup_result?;
+        unlock_result?;
+
         Ok(Self {
             path,
             file: Mutex::new(file),
+            fence_file: Mutex::new(fence_file),
+            writer_token,
         })
     }
 
     fn append_and_sync(&self, permit: &DurableEgressPermit) -> io::Result<()> {
         let mut line = serde_json::to_vec(permit).map_err(io::Error::other)?;
         line.push(b'\n');
-        let mut file = self
-            .file
+
+        let mut fence_file = self
+            .fence_file
             .lock()
-            .map_err(|_| io::Error::other("BLACKBOX permit journal lock poisoned"))?;
-        file.write_all(&line)?;
-        file.sync_all()?;
-        Ok(())
+            .map_err(|_| io::Error::other("BLACKBOX writer fence lock poisoned"))?;
+        file_lock_exclusive(&fence_file)?;
+
+        let result = (|| -> io::Result<()> {
+            let current_token = read_writer_token(&mut fence_file)?;
+            if current_token != self.writer_token {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "BLACKBOX stale journal writer fenced by a newer store instance",
+                ));
+            }
+
+            let mut file = self
+                .file
+                .lock()
+                .map_err(|_| io::Error::other("BLACKBOX permit journal lock poisoned"))?;
+            file.write_all(&line)?;
+            file.sync_all()?;
+            Ok(())
+        })();
+
+        let unlock_result = file_lock_release(&fence_file);
+        result?;
+        unlock_result
     }
 
     #[cfg(test)]
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg(test)]
+    fn writer_token(&self) -> &str {
+        &self.writer_token
     }
 }
 
