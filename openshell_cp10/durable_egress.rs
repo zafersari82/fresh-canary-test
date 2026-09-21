@@ -17,6 +17,10 @@ use std::os::fd::AsRawFd;
 use uuid::Uuid;
 
 pub const JOURNAL_ENV: &str = "OPENSHELL_BLACKBOX_EGRESS_JOURNAL";
+pub const WITNESS_ENV: &str = "OPENSHELL_BLACKBOX_EGRESS_WITNESS";
+const JOURNAL_RECORD_SCHEMA: &str = "blackbox.openshell.journal-record.v1";
+const WITNESS_SCHEMA: &str = "blackbox.openshell.high-water-witness.v1";
+const GENESIS_HASH: &str = "0000000000000000000000000000000000000000000000000000000000000000";
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -252,7 +256,243 @@ fn validate_permit_record(permit: &DurableEgressPermit) -> io::Result<()> {
     Ok(())
 }
 
-fn recover_and_validate_journal(file: &mut File) -> io::Result<()> {
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct JournalRecord {
+    journal_schema: String,
+    sequence: u64,
+    prev_record_sha256: String,
+    #[serde(flatten)]
+    permit: DurableEgressPermit,
+    journal_record_sha256: String,
+}
+
+#[derive(Serialize)]
+struct JournalRecordCommitment<'a> {
+    journal_schema: &'static str,
+    sequence: u64,
+    prev_record_sha256: &'a str,
+    permit: &'a DurableEgressPermit,
+}
+
+fn compute_journal_record_sha256(
+    sequence: u64,
+    prev_record_sha256: &str,
+    permit: &DurableEgressPermit,
+) -> io::Result<String> {
+    let commitment = JournalRecordCommitment {
+        journal_schema: JOURNAL_RECORD_SCHEMA,
+        sequence,
+        prev_record_sha256,
+        permit,
+    };
+    Ok(sha256_hex(
+        &serde_json::to_vec(&commitment).map_err(io::Error::other)?,
+    ))
+}
+
+impl JournalRecord {
+    fn new(sequence: u64, prev_record_sha256: String, permit: DurableEgressPermit) -> io::Result<Self> {
+        let journal_record_sha256 =
+            compute_journal_record_sha256(sequence, &prev_record_sha256, &permit)?;
+        Ok(Self {
+            journal_schema: JOURNAL_RECORD_SCHEMA.to_string(),
+            sequence,
+            prev_record_sha256,
+            permit,
+            journal_record_sha256,
+        })
+    }
+
+    fn validate(&self, expected_sequence: u64, expected_prev: &str) -> io::Result<()> {
+        if self.journal_schema != JOURNAL_RECORD_SCHEMA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BLACKBOX journal record schema mismatch",
+            ));
+        }
+        if self.sequence != expected_sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "BLACKBOX journal sequence gap [expected:{expected_sequence} actual:{}]",
+                    self.sequence
+                ),
+            ));
+        }
+        if self.prev_record_sha256 != expected_prev {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BLACKBOX journal hash-chain predecessor mismatch",
+            ));
+        }
+        validate_permit_record(&self.permit)?;
+        let expected_hash = compute_journal_record_sha256(
+            self.sequence,
+            &self.prev_record_sha256,
+            &self.permit,
+        )?;
+        if expected_hash != self.journal_record_sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BLACKBOX journal record hash mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+struct HighWaterWitness {
+    schema: String,
+    sequence: u64,
+    head_record_sha256: String,
+    updated_unix_ns: u64,
+    witness_sha256: String,
+}
+
+#[derive(Serialize)]
+struct WitnessCommitment<'a> {
+    schema: &'static str,
+    sequence: u64,
+    head_record_sha256: &'a str,
+    updated_unix_ns: u64,
+}
+
+fn compute_witness_sha256(
+    sequence: u64,
+    head_record_sha256: &str,
+    updated_unix_ns: u64,
+) -> io::Result<String> {
+    let commitment = WitnessCommitment {
+        schema: WITNESS_SCHEMA,
+        sequence,
+        head_record_sha256,
+        updated_unix_ns,
+    };
+    Ok(sha256_hex(
+        &serde_json::to_vec(&commitment).map_err(io::Error::other)?,
+    ))
+}
+
+impl HighWaterWitness {
+    fn new(sequence: u64, head_record_sha256: String) -> io::Result<Self> {
+        let updated_unix_ns = unix_ns();
+        let witness_sha256 =
+            compute_witness_sha256(sequence, &head_record_sha256, updated_unix_ns)?;
+        Ok(Self {
+            schema: WITNESS_SCHEMA.to_string(),
+            sequence,
+            head_record_sha256,
+            updated_unix_ns,
+            witness_sha256,
+        })
+    }
+
+    fn validate(&self) -> io::Result<()> {
+        if self.schema != WITNESS_SCHEMA {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BLACKBOX high-water witness schema mismatch",
+            ));
+        }
+        if self.sequence == 0 && self.head_record_sha256 != GENESIS_HASH {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BLACKBOX genesis witness hash mismatch",
+            ));
+        }
+        let expected = compute_witness_sha256(
+            self.sequence,
+            &self.head_record_sha256,
+            self.updated_unix_ns,
+        )?;
+        if expected != self.witness_sha256 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BLACKBOX high-water witness commitment mismatch",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct JournalHead {
+    sequence: u64,
+    record_sha256: String,
+}
+
+impl JournalHead {
+    fn genesis() -> Self {
+        Self {
+            sequence: 0,
+            record_sha256: GENESIS_HASH.to_string(),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct StoreState {
+    head: JournalHead,
+    poisoned: bool,
+}
+
+struct JournalRecovery {
+    head: JournalHead,
+    valid_len: usize,
+    total_len: usize,
+}
+
+fn witness_path_for(journal: &Path) -> PathBuf {
+    let mut value = journal.as_os_str().to_os_string();
+    value.push(".witness");
+    PathBuf::from(value)
+}
+
+fn read_high_water_witness(path: &Path) -> io::Result<HighWaterWitness> {
+    let bytes = std::fs::read(path)?;
+    let witness: HighWaterWitness = serde_json::from_slice(&bytes).map_err(io::Error::other)?;
+    witness.validate()?;
+    Ok(witness)
+}
+
+fn write_high_water_witness(path: &Path, head: &JournalHead) -> io::Result<HighWaterWitness> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)?;
+    let witness = HighWaterWitness::new(head.sequence, head.record_sha256.clone())?;
+    let mut bytes = serde_json::to_vec(&witness).map_err(io::Error::other)?;
+    bytes.push(b'\n');
+
+    let file_name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("blackbox-witness");
+    let temp_path = parent.join(format!(".{file_name}.{}.tmp", Uuid::new_v4()));
+
+    let write_result = (|| -> io::Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&temp_path)?;
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        std::fs::rename(&temp_path, path)?;
+        sync_parent_directory(parent)?;
+        Ok(())
+    })();
+
+    if write_result.is_err() {
+        let _ = std::fs::remove_file(&temp_path);
+    }
+    write_result?;
+    Ok(witness)
+}
+
+fn recover_and_validate_journal(
+    file: &mut File,
+    witness: Option<&HighWaterWitness>,
+) -> io::Result<JournalRecovery> {
     file.seek(SeekFrom::Start(0))?;
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
@@ -265,7 +505,10 @@ fn recover_and_validate_journal(file: &mut File) -> io::Result<()> {
             .map_or(0, |position| position + 1)
     };
 
+    let mut head = JournalHead::genesis();
     let mut start = 0usize;
+    let mut witness_matched = witness.is_some_and(|value| value.sequence == 0);
+
     while start < valid_len {
         let relative_end = bytes[start..valid_len]
             .iter()
@@ -278,37 +521,101 @@ fn recover_and_validate_journal(file: &mut File) -> io::Result<()> {
                 "BLACKBOX journal contains an empty interior record",
             ));
         }
-        let permit: DurableEgressPermit =
+
+        let record: JournalRecord =
             serde_json::from_slice(&bytes[start..end]).map_err(io::Error::other)?;
-        validate_permit_record(&permit)?;
+        let expected_sequence = head.sequence.checked_add(1).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "BLACKBOX journal sequence overflow")
+        })?;
+        record.validate(expected_sequence, &head.record_sha256)?;
+
+        if let Some(witness) = witness
+            && record.sequence == witness.sequence
+        {
+            if record.journal_record_sha256 != witness.head_record_sha256 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "BLACKBOX journal disagrees with preserved high-water witness",
+                ));
+            }
+            witness_matched = true;
+        }
+
+        head = JournalHead {
+            sequence: record.sequence,
+            record_sha256: record.journal_record_sha256,
+        };
         start = end + 1;
     }
 
-    if valid_len < bytes.len() {
-        file.set_len(u64::try_from(valid_len).map_err(io::Error::other)?)?;
-        file.sync_all()?;
+    if let Some(witness) = witness {
+        if witness.sequence > head.sequence {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "BLACKBOX journal rollback detected [witness_sequence:{} journal_sequence:{}]",
+                    witness.sequence, head.sequence
+                ),
+            ));
+        }
+        if !witness_matched {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BLACKBOX journal does not contain preserved witness head",
+            ));
+        }
     }
-    file.seek(SeekFrom::End(0))?;
-    Ok(())
+
+    Ok(JournalRecovery {
+        head,
+        valid_len,
+        total_len: bytes.len(),
+    })
 }
 
 #[derive(Debug)]
 struct PermitStore {
     path: PathBuf,
+    witness_path: PathBuf,
     file: Mutex<File>,
     fence_file: Mutex<File>,
+    state: Mutex<StoreState>,
     writer_token: String,
 }
 
 impl PermitStore {
     fn open(path: impl AsRef<Path>) -> io::Result<Self> {
         let path = path.as_ref().to_path_buf();
+        let witness_path = witness_path_for(&path);
+        Self::open_with_witness(path, witness_path)
+    }
+
+    fn open_with_witness(
+        path: impl AsRef<Path>,
+        witness_path: impl AsRef<Path>,
+    ) -> io::Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let witness_path = witness_path.as_ref().to_path_buf();
         let parent = path.parent().unwrap_or_else(|| Path::new("."));
         std::fs::create_dir_all(parent)?;
 
         let lock_path = lock_path_for(&path);
         let journal_existed = path.exists();
         let lock_existed = lock_path.exists();
+        let witness_existed = witness_path.exists();
+
+        if !journal_existed && witness_existed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BLACKBOX journal missing while high-water witness exists",
+            ));
+        }
+        if journal_existed && !witness_existed {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "BLACKBOX high-water witness missing for existing journal",
+            ));
+        }
 
         let mut fence_file = OpenOptions::new()
             .create(true)
@@ -318,12 +625,18 @@ impl PermitStore {
         file_lock_exclusive(&fence_file)?;
 
         let writer_token = Uuid::new_v4().to_string();
-        let setup_result = (|| -> io::Result<File> {
+        let setup_result = (|| -> io::Result<(File, JournalHead)> {
             fence_file.set_len(0)?;
             fence_file.seek(SeekFrom::Start(0))?;
             fence_file.write_all(writer_token.as_bytes())?;
             fence_file.write_all(b"\n")?;
             fence_file.sync_all()?;
+
+            let witness = if witness_existed {
+                Some(read_high_water_witness(&witness_path)?)
+            } else {
+                None
+            };
 
             let mut journal = OpenOptions::new()
                 .create(true)
@@ -331,30 +644,56 @@ impl PermitStore {
                 .read(true)
                 .write(true)
                 .open(&path)?;
-            recover_and_validate_journal(&mut journal)?;
+
+            let recovery = recover_and_validate_journal(&mut journal, witness.as_ref())?;
+
+            if recovery.valid_len < recovery.total_len {
+                journal.set_len(u64::try_from(recovery.valid_len).map_err(io::Error::other)?)?;
+                journal.sync_all()?;
+            }
+            journal.seek(SeekFrom::End(0))?;
+
+            match witness {
+                None => {
+                    if recovery.head.sequence != 0 {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "BLACKBOX non-empty journal has no high-water witness",
+                        ));
+                    }
+                    write_high_water_witness(&witness_path, &recovery.head)?;
+                }
+                Some(existing) if recovery.head.sequence > existing.sequence => {
+                    write_high_water_witness(&witness_path, &recovery.head)?;
+                }
+                Some(_) => {}
+            }
 
             if !journal_existed || !lock_existed {
                 sync_parent_directory(parent)?;
             }
-            Ok(journal)
+
+            Ok((journal, recovery.head))
         })();
 
         let unlock_result = file_lock_release(&fence_file);
-        let file = setup_result?;
+        let (file, head) = setup_result?;
         unlock_result?;
 
         Ok(Self {
             path,
+            witness_path,
             file: Mutex::new(file),
             fence_file: Mutex::new(fence_file),
+            state: Mutex::new(StoreState {
+                head,
+                poisoned: false,
+            }),
             writer_token,
         })
     }
 
     fn append_and_sync(&self, permit: &DurableEgressPermit) -> io::Result<()> {
-        let mut line = serde_json::to_vec(permit).map_err(io::Error::other)?;
-        line.push(b'\n');
-
         let mut fence_file = self
             .fence_file
             .lock()
@@ -370,12 +709,48 @@ impl PermitStore {
                 ));
             }
 
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| io::Error::other("BLACKBOX journal state lock poisoned"))?;
+            if state.poisoned {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    "BLACKBOX journal store requires restart reconciliation",
+                ));
+            }
+
+            let next_sequence = state.head.sequence.checked_add(1).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "BLACKBOX journal sequence overflow")
+            })?;
+            let record = JournalRecord::new(
+                next_sequence,
+                state.head.record_sha256.clone(),
+                permit.clone(),
+            )?;
+            let mut line = serde_json::to_vec(&record).map_err(io::Error::other)?;
+            line.push(b'\n');
+
             let mut file = self
                 .file
                 .lock()
                 .map_err(|_| io::Error::other("BLACKBOX permit journal lock poisoned"))?;
-            file.write_all(&line)?;
-            file.sync_all()?;
+
+            if let Err(error) = file.write_all(&line).and_then(|_| file.sync_all()) {
+                state.poisoned = true;
+                return Err(error);
+            }
+
+            let next_head = JournalHead {
+                sequence: record.sequence,
+                record_sha256: record.journal_record_sha256.clone(),
+            };
+            if let Err(error) = write_high_water_witness(&self.witness_path, &next_head) {
+                state.poisoned = true;
+                return Err(error);
+            }
+
+            state.head = next_head;
             Ok(())
         })();
 
@@ -387,6 +762,11 @@ impl PermitStore {
     #[cfg(test)]
     fn path(&self) -> &Path {
         &self.path
+    }
+
+    #[cfg(test)]
+    fn witness_path(&self) -> &Path {
+        &self.witness_path
     }
 
     #[cfg(test)]
@@ -408,6 +788,17 @@ impl DurableEgressPermitGate {
         authority: Arc<DispatchAuthorityFence>,
         journal_path: impl AsRef<Path>,
     ) -> Result<Self> {
+        let journal_path = journal_path.as_ref().to_path_buf();
+        let witness_path = witness_path_for(&journal_path);
+        Self::new_with_witness(sandbox_id, authority, journal_path, witness_path)
+    }
+
+    pub(crate) fn new_with_witness(
+        sandbox_id: impl Into<String>,
+        authority: Arc<DispatchAuthorityFence>,
+        journal_path: impl AsRef<Path>,
+        witness_path: impl AsRef<Path>,
+    ) -> Result<Self> {
         let sandbox_id = sandbox_id.into();
         if sandbox_id.is_empty() {
             return Err(miette::miette!("BLACKBOX durable egress gate requires sandbox_id"));
@@ -415,7 +806,9 @@ impl DurableEgressPermitGate {
         Ok(Self {
             sandbox_id: Arc::<str>::from(sandbox_id),
             authority,
-            store: Arc::new(PermitStore::open(journal_path).into_diagnostic()?),
+            store: Arc::new(
+                PermitStore::open_with_witness(journal_path, witness_path).into_diagnostic()?,
+            ),
         })
     }
 
@@ -518,10 +911,15 @@ pub(crate) fn gate_from_env(sandbox_id: Option<&str>) -> Result<Option<Arc<Durab
     let Some(path) = std::env::var_os(JOURNAL_ENV) else {
         return Ok(None);
     };
-    Ok(Some(Arc::new(DurableEgressPermitGate::new(
+    let journal_path = PathBuf::from(path);
+    let witness_path = std::env::var_os(WITNESS_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| witness_path_for(&journal_path));
+    Ok(Some(Arc::new(DurableEgressPermitGate::new_with_witness(
         sandbox_id,
         Arc::clone(&GLOBAL_DISPATCH_FENCE),
-        PathBuf::from(path),
+        journal_path,
+        witness_path,
     )?)))
 }
 
