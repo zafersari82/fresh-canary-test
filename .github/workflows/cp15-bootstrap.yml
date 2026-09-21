@@ -1,4 +1,4 @@
-name: CP15 live runtime lifecycle
+name: CP15 full runtime E2E
 
 on:
   push:
@@ -7,25 +7,19 @@ on:
 
 permissions:
   contents: read
-  packages: read
 
 jobs:
   cp15:
     runs-on: ubuntu-latest
-    timeout-minutes: 50
+    timeout-minutes: 60
+    env:
+      OPENSHELL_DOCKER_SUPERVISOR_IMAGE: openshell/supervisor:dev
+      OPENSHELL_DOCKER_SANDBOX_RUNTIME_IMAGE: openshell/sandbox:dev
     steps:
-      - name: Host prerequisites
-        run: |
-          docker version
-          python3 --version
-          sudo apt-get update
-          sudo apt-get install -y openssh-client jq
-          sudo rm -rf /var/lib/apt/lists/*
-
-      - name: Checkout CP15 harness
+      - name: Checkout CP15 branch
         uses: actions/checkout@v4
         with:
-          ref: cp15-runtime-lifecycle
+          ref: cp15-full-runtime-e2e
 
       - name: Checkout pinned NVIDIA OpenShell
         run: |
@@ -35,7 +29,7 @@ jobs:
 
       - name: Apply CP15 integration
         run: |
-          python3 openshell_cp15/apply_cp15.py upstream
+          python3 openshell_cp10/apply_cp10.py upstream
           git -C upstream diff --check
           git -C upstream diff --stat
 
@@ -47,41 +41,23 @@ jobs:
 
       - name: Rustfmt
         working-directory: upstream
-        run: cargo +1.95.0 fmt --all
+        run: |
+          cargo +1.95.0 fmt --all
+          git diff --check
 
-      - name: Cargo check runtime crates
-        working-directory: upstream
-        run: cargo +1.95.0 check -p openshell-supervisor-network -p openshell-supervisor-process -p openshell-supervisor -p openshell-driver-docker
-
-      - name: Compile CP15 e2e test
-        working-directory: upstream
-        run: cargo +1.95.0 test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test cp15_blackbox_runtime --no-run
-
-      - name: Install OpenShell image staging tools
+      - name: Cargo check runtime and focused E2E
         working-directory: upstream
         run: |
-          curl https://mise.run | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-          export PATH="$HOME/.local/bin:$PATH"
-          mise --version
-          mise install rust zig github:rust-cross/cargo-zigbuild github:mozilla/sccache
+          cargo +1.95.0 check             -p openshell-supervisor-network             -p openshell-supervisor-process             -p openshell-supervisor             -p openshell-driver-docker
+          cargo +1.95.0 check             --manifest-path e2e/rust/Cargo.toml             --features e2e-docker             --test blackbox_acv_runtime
 
-      - name: Stage ABI-correct Docker runtime binaries
+      - name: Docker preflight
+        run: |
+          docker version
+          docker info
+          docker run --rm hello-world >/dev/null
+
+      - name: Run real Docker gateway supervisor sandbox lifecycle
         working-directory: upstream
         run: |
-          export PATH="$HOME/.local/bin:$PATH"
-          PREBUILT_ARCH=amd64 bash tasks/scripts/stage-prebuilt-binaries.sh supervisor
-          PREBUILT_ARCH=amd64 bash tasks/scripts/stage-prebuilt-binaries.sh sandbox
-          test -x deploy/docker/.build/prebuilt-binaries/amd64/openshell-supervisor
-          test -x deploy/docker/.build/prebuilt-binaries/amd64/openshell-sandbox
-          file deploy/docker/.build/prebuilt-binaries/amd64/openshell-supervisor
-          file deploy/docker/.build/prebuilt-binaries/amd64/openshell-sandbox
-
-      - name: Run live Docker gateway supervisor sandbox lifecycle
-        working-directory: upstream
-        env:
-          OPENSHELL_BLACKBOX_E2E_EVIDENCE: "1"
-          OPENSHELL_E2E_DOCKER_TEST: cp15_blackbox_runtime
-          OPENSHELL_DOCKER_SUPERVISOR_IMAGE: openshell/supervisor:dev
-          OPENSHELL_DOCKER_SANDBOX_RUNTIME_IMAGE: openshell/sandbox:dev
-        run: bash e2e/rust/e2e-docker.sh
+          bash e2e/with-docker-gateway.sh             cargo +1.95.0 test               --manifest-path e2e/rust/Cargo.toml               --features e2e-docker               --test blackbox_acv_runtime               -- --nocapture
