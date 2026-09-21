@@ -36,9 +36,11 @@ jobs:
           rustc +1.95.0 --version
           cargo +1.95.0 --version
 
-      - name: Rustfmt
+      - name: Rustfmt normalize
         working-directory: upstream
-        run: cargo +1.95.0 fmt --all -- --check
+        run: |
+          cargo +1.95.0 fmt --all
+          git diff --check
 
       - name: Cargo check affected crates
         working-directory: upstream
