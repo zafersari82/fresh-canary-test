@@ -490,4 +490,152 @@ mod tests {
 
         assert!(gate.linearize_dispatch(&engine, &guard, &permit).is_err());
     }
+
+    async fn assert_receiver_silent(listener: tokio::net::TcpListener) {
+        let observed = tokio::time::timeout(
+            std::time::Duration::from_millis(80),
+            listener.accept(),
+        )
+        .await;
+        assert!(
+            observed.is_err(),
+            "receiver unexpectedly observed a network effect before dial"
+        );
+    }
+
+    #[tokio::test]
+    async fn crash_matrix_after_permit_before_dispatch_persists_without_effect() {
+        use tokio::net::TcpListener;
+
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("session-a".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gate =
+            DurableEgressPermitGate::new("sandbox-a", Arc::clone(&authority), &journal).unwrap();
+
+        let permit = gate
+            .commit_before_effect(&guard, test_input())
+            .await
+            .expect("durable permit before simulated crash");
+
+        drop(gate);
+
+        let recovered = std::fs::read_to_string(&journal).unwrap();
+        assert!(recovered.contains(&permit.operation_id));
+        assert_eq!(recovered.lines().count(), 1);
+        assert_receiver_silent(listener).await;
+    }
+
+    #[tokio::test]
+    async fn crash_matrix_after_dispatch_before_dial_persists_without_effect() {
+        use tokio::net::TcpListener;
+
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("session-a".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let gate =
+            DurableEgressPermitGate::new("sandbox-a", Arc::clone(&authority), &journal).unwrap();
+
+        let permit = gate
+            .commit_before_effect(&guard, test_input())
+            .await
+            .expect("durable permit");
+        let lease = gate
+            .linearize_dispatch(&engine, &guard, &permit)
+            .expect("dispatch linearization");
+        assert!(lease.dispatch_sequence > 0);
+
+        drop(gate);
+
+        let recovered = std::fs::read_to_string(&journal).unwrap();
+        assert!(recovered.contains(&permit.operation_id));
+        assert_receiver_silent(listener).await;
+    }
+
+    #[tokio::test]
+    async fn crash_matrix_after_dial_before_outcome_preserves_permit_and_effect() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("session-a".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let gate =
+            DurableEgressPermitGate::new("sandbox-a", Arc::clone(&authority), &journal).unwrap();
+
+        let permit = gate
+            .commit_before_effect(&guard, test_input())
+            .await
+            .expect("durable permit");
+        gate.linearize_dispatch(&engine, &guard, &permit)
+            .expect("dispatch linearization");
+
+        let receiver = tokio::spawn(async move {
+            let (_stream, _peer) = listener.accept().await.unwrap();
+            unix_ns()
+        });
+
+        let client = TcpStream::connect(address).await.unwrap();
+        drop(client);
+        drop(gate);
+
+        let observed_ns = receiver.await.unwrap();
+        let recovered = std::fs::read_to_string(&journal).unwrap();
+        assert!(recovered.contains(&permit.operation_id));
+        assert!(permit.committed_unix_ns <= observed_ns);
+    }
+
+    #[tokio::test]
+    async fn restart_reopens_existing_journal_without_losing_permit() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("session-a".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+
+        let permit = {
+            let gate = DurableEgressPermitGate::new(
+                "sandbox-a",
+                Arc::clone(&authority),
+                &journal,
+            )
+            .unwrap();
+            gate.commit_before_effect(&guard, test_input())
+                .await
+                .expect("permit before restart")
+        };
+
+        let reopened =
+            DurableEgressPermitGate::new("sandbox-a", Arc::clone(&authority), &journal).unwrap();
+        drop(reopened);
+
+        let recovered = std::fs::read_to_string(&journal).unwrap();
+        assert_eq!(recovered.lines().count(), 1);
+        assert!(recovered.contains(&permit.operation_id));
+    }
 }
