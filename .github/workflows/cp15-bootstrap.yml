@@ -51,6 +51,26 @@ jobs:
           cargo +1.95.0 check             -p openshell-supervisor-network             -p openshell-supervisor-process             -p openshell-supervisor             -p openshell-driver-docker
           cargo +1.95.0 check             --manifest-path e2e/rust/Cargo.toml             --features e2e-docker             --test blackbox_acv_runtime
 
+      - name: Install OpenShell image staging tools
+        working-directory: upstream
+        run: |
+          curl https://mise.run | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.local/bin:$PATH"
+          mise --version
+          mise install rust zig github:rust-cross/cargo-zigbuild github:mozilla/sccache
+
+      - name: Stage patched Docker runtime binaries
+        working-directory: upstream
+        run: |
+          export PATH="$HOME/.local/bin:$PATH"
+          PREBUILT_ARCH=amd64 bash tasks/scripts/stage-prebuilt-binaries.sh supervisor
+          PREBUILT_ARCH=amd64 bash tasks/scripts/stage-prebuilt-binaries.sh sandbox
+          test -x deploy/docker/.build/prebuilt-binaries/amd64/openshell-supervisor
+          test -x deploy/docker/.build/prebuilt-binaries/amd64/openshell-sandbox
+          file deploy/docker/.build/prebuilt-binaries/amd64/openshell-supervisor
+          file deploy/docker/.build/prebuilt-binaries/amd64/openshell-sandbox
+
       - name: Docker preflight
         run: |
           docker version
