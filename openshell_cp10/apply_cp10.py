@@ -372,6 +372,13 @@ s=rep(s,
     ) -> Result<Self> {''',
 'transparent start gate signature')
 s=rep(s,
+'''            let mut engine_ready = engine_ready.clone();
+            joins.push(tokio::spawn(async move {''',
+'''            let mut engine_ready = engine_ready.clone();
+            let durable_egress_gate = durable_egress_gate.clone();
+            joins.push(tokio::spawn(async move {''',
+'transparent listener gate clone')
+s=rep(s,
 '''                    let upstream_proxy = upstream_proxy.clone();
                     tokio::spawn(async move {''',
 '''                    let upstream_proxy = upstream_proxy.clone();
