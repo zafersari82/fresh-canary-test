@@ -1083,4 +1083,260 @@ mod tests {
         );
     }
 
+
+    #[tokio::test]
+    async fn newer_store_instance_fences_older_writer_without_killing_it() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("cp13-session".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+
+        let old_gate = DurableEgressPermitGate::new(
+            "sandbox-old",
+            Arc::clone(&authority),
+            &journal,
+        )
+        .unwrap();
+        let old_token = old_gate.store.writer_token().to_string();
+
+        let new_gate = DurableEgressPermitGate::new(
+            "sandbox-new",
+            Arc::clone(&authority),
+            &journal,
+        )
+        .unwrap();
+        let new_token = new_gate.store.writer_token().to_string();
+        assert_ne!(old_token, new_token);
+
+        let stale_result = old_gate.commit_before_effect(&guard, test_input()).await;
+        assert!(stale_result.is_err(), "superseded writer must fail closed");
+
+        let permit = new_gate
+            .commit_before_effect(&guard, test_input())
+            .await
+            .expect("newest writer must append");
+        let recovered = std::fs::read_to_string(&journal).unwrap();
+        assert_eq!(recovered.lines().count(), 1);
+        assert!(recovered.contains(&permit.operation_id));
+    }
+
+    #[tokio::test]
+    async fn torn_tail_is_truncated_to_last_verified_record() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("cp13-session".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let gate = DurableEgressPermitGate::new(
+            "sandbox-a",
+            Arc::clone(&authority),
+            &journal,
+        )
+        .unwrap();
+        let permit = gate
+            .commit_before_effect(&guard, test_input())
+            .await
+            .expect("baseline permit");
+        drop(gate);
+
+        {
+            let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
+            file.write_all(br#"{"schema":"torn"#).unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let reopened = DurableEgressPermitGate::new(
+            "sandbox-b",
+            Arc::clone(&authority),
+            &journal,
+        )
+        .expect("torn final fragment should be recovered");
+        drop(reopened);
+
+        let recovered = std::fs::read_to_string(&journal).unwrap();
+        assert_eq!(recovered.lines().count(), 1);
+        assert!(recovered.ends_with('\n'));
+        assert!(recovered.contains(&permit.operation_id));
+        assert!(!recovered.contains("torn"));
+    }
+
+    #[tokio::test]
+    async fn complete_corrupt_record_fails_closed_and_fences_previous_writer() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("cp13-session".into()));
+
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let old_gate = DurableEgressPermitGate::new(
+            "sandbox-old",
+            Arc::clone(&authority),
+            &journal,
+        )
+        .unwrap();
+        old_gate
+            .commit_before_effect(&guard, test_input())
+            .await
+            .expect("baseline permit");
+
+        {
+            let mut file = OpenOptions::new().append(true).open(&journal).unwrap();
+            file.write_all(b"{\"complete_but_corrupt\":true}\n").unwrap();
+            file.sync_all().unwrap();
+        }
+
+        let reopen = DurableEgressPermitGate::new(
+            "sandbox-new",
+            Arc::clone(&authority),
+            &journal,
+        );
+        assert!(reopen.is_err(), "complete corrupt record must fail closed");
+
+        let stale_result = old_gate.commit_before_effect(&guard, test_input()).await;
+        assert!(
+            stale_result.is_err(),
+            "failed recovery attempt must still fence the previously active writer"
+        );
+    }
+
+    #[test]
+    fn new_store_durably_creates_journal_and_fence_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir_all(&nested).unwrap();
+        let journal = nested.join("permits.jsonl");
+        let lock_path = lock_path_for(&journal);
+
+        let store = PermitStore::open(&journal).unwrap();
+        assert!(journal.exists());
+        assert!(lock_path.exists());
+        assert!(!store.writer_token().is_empty());
+        sync_parent_directory(&nested).unwrap();
+    }
+
+    #[test]
+    fn cp13_stale_writer_child() {
+        if std::env::var_os("BLACKBOX_CP13_CHILD").is_none() {
+            return;
+        }
+
+        let journal = PathBuf::from(std::env::var("BLACKBOX_CP13_JOURNAL").unwrap());
+        let marker = PathBuf::from(std::env::var("BLACKBOX_CP13_MARKER").unwrap());
+        let command = PathBuf::from(std::env::var("BLACKBOX_CP13_COMMAND").unwrap());
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+
+        runtime.block_on(async move {
+            let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+            let guard = engine
+                .generation_guard(engine.current_generation())
+                .expect("current generation guard");
+            let authority = Arc::new(DispatchAuthorityFence::default());
+            authority.publish_session(Some("cp13-child-session".into()));
+            let gate =
+                DurableEgressPermitGate::new("cp13-child", authority, &journal).unwrap();
+
+            cp12_write_marker(&marker, "opened");
+
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+            while !command.exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "CP13 child timed out waiting for command"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+
+            match gate.commit_before_effect(&guard, test_input()).await {
+                Ok(_) => cp12_write_marker(&marker, "unexpected_success"),
+                Err(_) => cp12_write_marker(&marker, "stale_rejected"),
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    fn cp13_wait_for_marker_value(path: &Path, expected: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Ok(value) = std::fs::read_to_string(path)
+                && value == expected
+            {
+                return;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for CP13 marker value {expected}"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_old_process_is_fenced_by_newer_writer_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let marker = dir.path().join("marker");
+        let command = dir.path().join("command");
+
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("durable_egress::tests::cp13_stale_writer_child")
+            .arg("--nocapture")
+            .env("BLACKBOX_CP13_CHILD", "1")
+            .env("BLACKBOX_CP13_JOURNAL", &journal)
+            .env("BLACKBOX_CP13_MARKER", &marker)
+            .env("BLACKBOX_CP13_COMMAND", &command)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn CP13 stale writer child");
+
+        cp13_wait_for_marker_value(&marker, "opened");
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let parent_operation = runtime.block_on(async {
+            let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+            let guard = engine
+                .generation_guard(engine.current_generation())
+                .expect("current generation guard");
+            let authority = Arc::new(DispatchAuthorityFence::default());
+            authority.publish_session(Some("cp13-parent-session".into()));
+            let gate =
+                DurableEgressPermitGate::new("cp13-parent", authority, &journal).unwrap();
+            gate.commit_before_effect(&guard, test_input())
+                .await
+                .expect("newer process writer permit")
+                .operation_id
+        });
+
+        cp12_write_marker(&command, "go");
+        cp13_wait_for_marker_value(&marker, "stale_rejected");
+
+        let status = child.wait().expect("wait CP13 stale writer child");
+        assert!(status.success());
+
+        let recovered = std::fs::read_to_string(&journal).unwrap();
+        assert_eq!(recovered.lines().count(), 1);
+        assert!(recovered.contains(&parent_operation));
+    }
+
 }
