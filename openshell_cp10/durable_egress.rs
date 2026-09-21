@@ -366,4 +366,128 @@ mod tests {
         let store = PermitStore::open(&path).unwrap();
         assert_eq!(store.path(), path);
     }
+
+    fn test_input<'a>() -> PermitInput<'a> {
+        PermitInput {
+            surface: EgressSurface::ForwardHttp,
+            host: "LOCALHOST.",
+            port: 8080,
+            matched_policy: "test-policy",
+            binary_path: "/bin/test-agent",
+            binary_pid: Some(42),
+        }
+    }
+
+    #[tokio::test]
+    async fn permit_requires_active_supervisor_session_and_writes_nothing_on_rejection() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let gate = DurableEgressPermitGate::new("sandbox-a", authority, &journal).unwrap();
+
+        assert!(gate.commit_before_effect(&guard, test_input()).await.is_err());
+        assert_eq!(std::fs::read(&journal).unwrap_or_default(), b"");
+    }
+
+    #[tokio::test]
+    async fn durable_permit_is_synced_before_receiver_observes_effect() {
+        use tokio::net::{TcpListener, TcpStream};
+
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("session-a".into()));
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let gate =
+            DurableEgressPermitGate::new("sandbox-a", Arc::clone(&authority), &journal).unwrap();
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+
+        let permit = gate
+            .commit_before_effect(&guard, test_input())
+            .await
+            .expect("durable permit");
+        let lease = gate
+            .linearize_dispatch(&engine, &guard, &permit)
+            .expect("dispatch lease");
+        assert!(lease.dispatch_sequence > 0);
+
+        let journal_before_dial = std::fs::read_to_string(&journal).unwrap();
+        assert!(
+            journal_before_dial.contains(&permit.operation_id),
+            "durable journal must contain operation before dial"
+        );
+
+        let receiver = tokio::spawn(async move {
+            let (_socket, _peer) = listener.accept().await.unwrap();
+            unix_ns()
+        });
+        let _client = TcpStream::connect(address).await.unwrap();
+        let received_ns = receiver.await.unwrap();
+
+        assert!(
+            permit.committed_unix_ns <= received_ns,
+            "permit commit timestamp must not follow receiver observation"
+        );
+        let records: Vec<&str> = journal_before_dial.lines().collect();
+        assert_eq!(records.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn session_replacement_after_permit_blocks_dispatch() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("session-a".into()));
+        let dir = tempfile::tempdir().unwrap();
+        let gate = DurableEgressPermitGate::new(
+            "sandbox-a",
+            Arc::clone(&authority),
+            dir.path().join("permits.jsonl"),
+        )
+        .unwrap();
+
+        let permit = gate
+            .commit_before_effect(&guard, test_input())
+            .await
+            .expect("permit before replacement");
+        authority.publish_session(Some("session-b".into()));
+
+        assert!(gate.linearize_dispatch(&engine, &guard, &permit).is_err());
+    }
+
+    #[tokio::test]
+    async fn policy_change_after_permit_blocks_dispatch() {
+        let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+        let guard = engine
+            .generation_guard(engine.current_generation())
+            .expect("current generation guard");
+        let authority = Arc::new(DispatchAuthorityFence::default());
+        authority.publish_session(Some("session-a".into()));
+        let dir = tempfile::tempdir().unwrap();
+        let gate = DurableEgressPermitGate::new(
+            "sandbox-a",
+            authority,
+            dir.path().join("permits.jsonl"),
+        )
+        .unwrap();
+
+        let permit = gate
+            .commit_before_effect(&guard, test_input())
+            .await
+            .expect("permit before policy change");
+        engine.enter_fail_closed("revoked before dial").unwrap();
+
+        assert!(gate.linearize_dispatch(&engine, &guard, &permit).is_err());
+    }
 }
