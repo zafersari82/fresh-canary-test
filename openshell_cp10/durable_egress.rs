@@ -331,7 +331,7 @@ fn unix_ns() -> u64 {
 mod tests {
     use super::*;
 
-    const POLICY: &str = include_str!("data/sandbox-policy.rego");
+    const POLICY: &str = include_str!("../data/sandbox-policy.rego");
 
     #[test]
     fn dispatch_fence_rejects_session_aba() {
