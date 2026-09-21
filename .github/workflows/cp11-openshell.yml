@@ -1,0 +1,67 @@
+name: CP11 OpenShell compile
+
+on:
+  push:
+    branches: [cp11-openshell-ci]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  compile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Checkout pinned NVIDIA OpenShell
+        run: |
+          git clone --filter=blob:none https://github.com/NVIDIA/OpenShell.git upstream
+          git -C upstream checkout 484f0768fc6a0d93e0a2be295c1679aed24e18a9
+          test "$(git -C upstream rev-parse HEAD)" = "484f0768fc6a0d93e0a2be295c1679aed24e18a9"
+
+      - name: Apply BLACKBOX CP11 integration
+        run: |
+          python3 openshell_cp11/apply_cp11.py upstream
+          git -C upstream diff --check
+          git -C upstream diff --stat
+
+      - name: Use OpenShell pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc +1.95.0 --version
+          cargo +1.95.0 --version
+
+      - name: Rustfmt normalize
+        working-directory: upstream
+        run: |
+          cargo +1.95.0 fmt --all
+          git diff --check
+
+      - name: Cargo check affected crates
+        working-directory: upstream
+        run: cargo +1.95.0 check -p openshell-supervisor-network -p openshell-supervisor-process -p openshell-supervisor
+
+      - name: CP11 Rust unit tests
+        working-directory: upstream
+        run: cargo +1.95.0 test -p openshell-supervisor-network durable_egress --lib -- --nocapture
+
+      - name: Export exact verified CP11 artifact
+        run: |
+          git -C upstream diff --binary > openshell_cp11/CP11_OPENSHELL_PINNED.patch
+          {
+            echo "openshell_commit=$(git -C upstream rev-parse HEAD)"
+            echo "harness_commit=$GITHUB_SHA"
+            rustc +1.95.0 --version
+            cargo +1.95.0 --version
+          } > openshell_cp11/CP11_COMPILE_EVIDENCE.txt
+
+      - name: Upload CP11 verified artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: blackbox-cp11-openshell-verified
+          path: openshell_cp11/
+          if-no-files-found: error
