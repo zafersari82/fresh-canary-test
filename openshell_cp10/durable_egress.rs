@@ -37,7 +37,7 @@ pub(crate) struct PermitInput<'a> {
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct DurableEgressPermit {
     pub(crate) schema: String,
-    pub(crate) operation_id: Uuid,
+    pub(crate) operation_id: String,
     pub(crate) sandbox_id: String,
     pub(crate) supervisor_session_id: String,
     pub(crate) supervisor_session_epoch: u64,
@@ -217,7 +217,7 @@ impl DurableEgressPermitGate {
         let generation = generation_guard.captured_generation();
         let host = input.host.trim_end_matches('.').to_ascii_lowercase();
         let committed_unix_ns = unix_ns();
-        let operation_id = Uuid::new_v4();
+        let operation_id = Uuid::new_v4().to_string();
 
         let intent = serde_json::json!({
             "surface": input.surface,
@@ -230,7 +230,7 @@ impl DurableEgressPermitGate {
         let intent_sha256 = sha256_hex(&serde_json::to_vec(&intent).into_diagnostic()?);
         let record = serde_json::json!({
             "schema": "blackbox.openshell.durable-egress-permit.v2",
-            "operation_id": operation_id,
+            "operation_id": &operation_id,
             "sandbox_id": &*self.sandbox_id,
             "supervisor_session_id": session_id,
             "supervisor_session_epoch": session_epoch,
