@@ -1,0 +1,66 @@
+name: CP15 live runtime lifecycle
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: read
+
+jobs:
+  cp15:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    container:
+      image: ghcr.io/nvidia/openshell/ci:37072ee81cd7b294c714bfa5ecc829b6927b3d70
+      options: --privileged
+      volumes:
+        - /var/run/docker.sock:/var/run/docker.sock
+        - /home/runner/_work:/home/runner/_work
+    steps:
+      - name: Checkout CP15 harness
+        uses: actions/checkout@v4
+        with:
+          ref: cp15-runtime-lifecycle
+
+      - name: Checkout pinned NVIDIA OpenShell
+        run: |
+          git clone --filter=blob:none https://github.com/NVIDIA/OpenShell.git upstream
+          git -C upstream checkout 484f0768fc6a0d93e0a2be295c1679aed24e18a9
+          test "$(git -C upstream rev-parse HEAD)" = "484f0768fc6a0d93e0a2be295c1679aed24e18a9"
+
+      - name: Apply CP15 integration
+        run: |
+          python3 openshell_cp15/apply_cp15.py upstream
+          git -C upstream diff --check
+          git -C upstream diff --stat
+
+      - name: Use pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc +1.95.0 --version
+          cargo +1.95.0 --version
+
+      - name: Rustfmt
+        working-directory: upstream
+        run: cargo +1.95.0 fmt --all
+
+      - name: Cargo check runtime crates
+        working-directory: upstream
+        run: cargo +1.95.0 check -p openshell-supervisor-network -p openshell-supervisor-process -p openshell-supervisor -p openshell-driver-docker
+
+      - name: Compile CP15 e2e test
+        working-directory: upstream
+        run: cargo +1.95.0 test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test cp15_blackbox_runtime --no-run
+
+      - name: Run live Docker gateway supervisor sandbox lifecycle
+        working-directory: upstream
+        env:
+          OPENSHELL_BLACKBOX_E2E_EVIDENCE: "1"
+          OPENSHELL_E2E_DOCKER_TEST: cp15_blackbox_runtime
+          OPENSHELL_DOCKER_SUPERVISOR_IMAGE: openshell/supervisor:dev
+          OPENSHELL_DOCKER_SANDBOX_RUNTIME_IMAGE: openshell/sandbox:dev
+          MISE_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash e2e/rust/e2e-docker.sh
