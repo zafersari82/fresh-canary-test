@@ -148,11 +148,14 @@ s=rep(s,
 write(p,s)
 
 p='crates/openshell-supervisor-network/src/proxy.rs'; s=read(p)
-s=rep(s,
-'''use crate::identity::BinaryIdentityCache;''',
+s=s.replace(
+'''use crate::identity::BinaryIdentityCache;
+use crate::l7::tls::ProxyTlsState;''',
 '''use crate::durable_egress::{DurableEgressPermitGate, EgressSurface, PermitInput};
-use crate::identity::BinaryIdentityCache;''',
-'proxy gate imports')
+use crate::identity::BinaryIdentityCache;
+use crate::l7::tls::ProxyTlsState;''',
+1,
+)
 
 old='''    pub(crate) async fn start_with_bind_addr(
         policy: &ProxyPolicy,
