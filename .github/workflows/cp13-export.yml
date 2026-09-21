@@ -1,0 +1,43 @@
+name: CP13 source export
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  export:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout CP13 branch
+        uses: actions/checkout@v4
+        with:
+          ref: cp13-writer-fence
+
+      - name: Checkout pinned OpenShell
+        run: |
+          git clone --filter=blob:none https://github.com/NVIDIA/OpenShell.git upstream
+          git -C upstream checkout 484f0768fc6a0d93e0a2be295c1679aed24e18a9
+
+      - name: Apply and export exact patch
+        run: |
+          python3 openshell_cp10/apply_cp10.py upstream
+          (cd upstream && cargo fmt --all)
+          mkdir -p cp13-export
+          cp upstream/crates/openshell-supervisor-network/src/durable_egress.rs cp13-export/durable_egress.rs
+          git -C upstream diff --binary > cp13-export/CP13_OPENSHELL_PINNED.patch
+          cat > cp13-export/SOURCE.txt <<'EOF'
+          BLACKBOX branch: cp13-writer-fence
+          BLACKBOX branch commit: 4326b1523a878687e9c091a0e8c659fdd7363756
+          NVIDIA/OpenShell pin: 484f0768fc6a0d93e0a2be295c1679aed24e18a9
+          Successful verification run: 35643771121
+          Successful verification job: 106479143621
+          EOF
+
+      - name: Upload exact CP13 source
+        uses: actions/upload-artifact@v4
+        with:
+          name: cp13-exact-source
+          path: cp13-export
