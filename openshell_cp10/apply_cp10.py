@@ -427,4 +427,29 @@ trans_insert='''    let approved_real_ip_candidates = connector.addrs().to_vec()
 s=rep(s,trans_anchor,trans_insert,'transparent permit hook')
 write(p,s)
 
-print('CP10 OpenShell patch applied')
+# CP15: enable BLACKBOX evidence only in the trusted Docker supervisor companion.
+p='crates/openshell-driver-docker/src/lib.rs'; s=read(p)
+s=rep(s,
+'''        format!(
+            "{}={}",
+            openshell_core::sandbox_env::TELEMETRY_ENABLED,
+            openshell_core::telemetry::enabled_env_value()
+        ),
+    ];''',
+'''        format!(
+            "{}={}",
+            openshell_core::sandbox_env::TELEMETRY_ENABLED,
+            openshell_core::telemetry::enabled_env_value()
+        ),
+        "OPENSHELL_BLACKBOX_EGRESS_JOURNAL=/var/log/blackbox-acv/permits.jsonl".to_string(),
+        "OPENSHELL_BLACKBOX_EGRESS_WITNESS=/var/log/blackbox-acv/witness.json".to_string(),
+    ];''',
+'docker supervisor BLACKBOX evidence env')
+write(p,s)
+
+write(
+    'e2e/rust/tests/blackbox_acv_runtime.rs',
+    (HERE.parent/'openshell_cp15'/'blackbox_acv_runtime.rs').read_text(),
+)
+
+print('CP15 OpenShell full-runtime patch applied')
