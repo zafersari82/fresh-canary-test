@@ -638,4 +638,237 @@ mod tests {
         assert_eq!(recovered.lines().count(), 1);
         assert!(recovered.contains(&permit.operation_id));
     }
+
+    fn cp12_write_marker(path: &Path, value: &str) {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+            .expect("create CP12 marker");
+        file.write_all(value.as_bytes()).expect("write CP12 marker");
+        file.sync_all().expect("sync CP12 marker");
+    }
+
+    fn cp12_wait_forever() -> ! {
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(60));
+        }
+    }
+
+    #[test]
+    fn cp12_child_worker() {
+        let Ok(stage) = std::env::var("BLACKBOX_CP12_STAGE") else {
+            return;
+        };
+
+        let journal = PathBuf::from(
+            std::env::var("BLACKBOX_CP12_JOURNAL").expect("CP12 journal path"),
+        );
+        let marker = PathBuf::from(
+            std::env::var("BLACKBOX_CP12_MARKER").expect("CP12 marker path"),
+        );
+        let receiver = std::env::var("BLACKBOX_CP12_RECEIVER").ok();
+
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("CP12 runtime");
+
+        runtime.block_on(async move {
+            let engine = OpaEngine::from_strings(POLICY, "network_policies: {}\n").unwrap();
+            let guard = engine
+                .generation_guard(engine.current_generation())
+                .expect("current generation guard");
+            let authority = Arc::new(DispatchAuthorityFence::default());
+            authority.publish_session(Some("cp12-session".into()));
+            let gate =
+                DurableEgressPermitGate::new("cp12-sandbox", Arc::clone(&authority), &journal)
+                    .unwrap();
+
+            if stage == "before_permit" {
+                cp12_write_marker(&marker, "before_permit");
+                cp12_wait_forever();
+            }
+
+            let permit = gate
+                .commit_before_effect(&guard, test_input())
+                .await
+                .expect("CP12 durable permit");
+
+            if stage == "after_permit" {
+                cp12_write_marker(&marker, &permit.operation_id);
+                cp12_wait_forever();
+            }
+
+            let lease = gate
+                .linearize_dispatch(&engine, &guard, &permit)
+                .expect("CP12 dispatch lease");
+            assert!(lease.dispatch_sequence > 0);
+
+            if stage == "after_dispatch" {
+                cp12_write_marker(&marker, &permit.operation_id);
+                cp12_wait_forever();
+            }
+
+            if stage == "after_dial" {
+                let receiver = receiver.expect("CP12 receiver address");
+                let _stream = tokio::net::TcpStream::connect(receiver)
+                    .await
+                    .expect("CP12 dial");
+                cp12_write_marker(&marker, &permit.operation_id);
+                cp12_wait_forever();
+            }
+
+            panic!("unknown CP12 child stage: {stage}");
+        });
+    }
+
+    #[cfg(unix)]
+    fn cp12_wait_for_marker(path: &Path) -> String {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+        loop {
+            if let Ok(value) = std::fs::read_to_string(path)
+                && !value.is_empty()
+            {
+                return value;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for CP12 marker at {}",
+                path.display()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+    }
+
+    #[cfg(unix)]
+    fn cp12_spawn_child(
+        stage: &str,
+        journal: &Path,
+        marker: &Path,
+        receiver: Option<std::net::SocketAddr>,
+    ) -> std::process::Child {
+        let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+        command
+            .arg("--exact")
+            .arg("durable_egress::tests::cp12_child_worker")
+            .arg("--nocapture")
+            .env("BLACKBOX_CP12_STAGE", stage)
+            .env("BLACKBOX_CP12_JOURNAL", journal)
+            .env("BLACKBOX_CP12_MARKER", marker)
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        if let Some(receiver) = receiver {
+            command.env("BLACKBOX_CP12_RECEIVER", receiver.to_string());
+        }
+        command.spawn().expect("spawn CP12 child")
+    }
+
+    #[cfg(unix)]
+    fn cp12_sigkill(child: &mut std::process::Child) {
+        use std::os::unix::process::ExitStatusExt;
+
+        child.kill().expect("SIGKILL CP12 child");
+        let status = child.wait().expect("wait for CP12 child");
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "CP12 child must terminate by SIGKILL"
+        );
+    }
+
+    #[cfg(unix)]
+    fn cp12_reopen_and_read(journal: &Path) -> String {
+        let reopened = PermitStore::open(journal).expect("reopen CP12 journal after process death");
+        drop(reopened);
+        std::fs::read_to_string(journal).unwrap_or_default()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_sigkill_before_permit_leaves_no_durable_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let marker = dir.path().join("marker");
+
+        let mut child = cp12_spawn_child("before_permit", &journal, &marker, None);
+        assert_eq!(cp12_wait_for_marker(&marker), "before_permit");
+        cp12_sigkill(&mut child);
+
+        assert!(
+            cp12_reopen_and_read(&journal).is_empty(),
+            "SIGKILL before permit must not leave durable authorization"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_sigkill_after_fsync_preserves_permit_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let marker = dir.path().join("marker");
+
+        let mut child = cp12_spawn_child("after_permit", &journal, &marker, None);
+        let operation_id = cp12_wait_for_marker(&marker);
+        cp12_sigkill(&mut child);
+
+        let recovered = cp12_reopen_and_read(&journal);
+        assert_eq!(recovered.lines().count(), 1);
+        assert!(recovered.contains(&operation_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_sigkill_after_dispatch_before_dial_preserves_permit_without_effect() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let marker = dir.path().join("marker");
+
+        let mut child = cp12_spawn_child("after_dispatch", &journal, &marker, None);
+        let operation_id = cp12_wait_for_marker(&marker);
+        cp12_sigkill(&mut child);
+
+        let recovered = cp12_reopen_and_read(&journal);
+        assert_eq!(recovered.lines().count(), 1);
+        assert!(recovered.contains(&operation_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn real_sigkill_after_dial_preserves_permit_and_receiver_observation() {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = dir.path().join("permits.jsonl");
+        let marker = dir.path().join("marker");
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let receiver_addr = listener.local_addr().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let receiver = std::thread::spawn(move || {
+            let (_stream, _peer) = listener.accept().expect("CP12 receiver accept");
+            tx.send(unix_ns()).unwrap();
+        });
+
+        let mut child =
+            cp12_spawn_child("after_dial", &journal, &marker, Some(receiver_addr));
+        let operation_id = cp12_wait_for_marker(&marker);
+        cp12_sigkill(&mut child);
+
+        let observed_ns = rx
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("CP12 receiver observation");
+        receiver.join().unwrap();
+
+        let recovered = cp12_reopen_and_read(&journal);
+        let line = recovered.lines().next().expect("CP12 durable permit record");
+        let record: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(recovered.lines().count(), 1);
+        assert_eq!(record["operation_id"].as_str(), Some(operation_id.as_str()));
+        let committed_ns = record["committed_unix_ns"].as_u64().unwrap();
+        assert!(
+            committed_ns <= observed_ns,
+            "durable permit commit must precede receiver observation after real SIGKILL"
+        );
+    }
+
 }
