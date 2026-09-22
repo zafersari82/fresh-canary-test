@@ -145,15 +145,13 @@ fn verify_evidence(journal: &str, witness: &str) {
     let matching = records
         .iter()
         .filter(|record| {
-            record.get("surface").and_then(Value::as_str) == Some("transparent_tcp")
-                && matches!(
-                    (
-                        record.get("host").and_then(Value::as_str),
-                        record.get("port").and_then(Value::as_u64)
-                    ),
-                    (Some(HTTP_HOST), Some(port)) if port == u64::from(HTTP_PORT)
-                        | (Some(TCP_HOST), Some(port)) if port == u64::from(TCP_PORT)
-                )
+            if record.get("surface").and_then(Value::as_str) != Some("transparent_tcp") {
+                return false;
+            }
+            let host = record.get("host").and_then(Value::as_str);
+            let port = record.get("port").and_then(Value::as_u64);
+            (host == Some(HTTP_HOST) && port == Some(u64::from(HTTP_PORT)))
+                || (host == Some(TCP_HOST) && port == Some(u64::from(TCP_PORT)))
         })
         .count();
     assert!(
