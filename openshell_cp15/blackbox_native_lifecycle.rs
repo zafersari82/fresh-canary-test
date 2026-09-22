@@ -35,30 +35,58 @@ fn session_failures(log: &str) -> usize {
     log.lines().filter(|line| line.contains("supervisor session failed, reconnecting")).count()
 }
 
-struct PausedGateway {
-    pid: u32,
-    paused: bool,
+fn gateway_port_from_args() -> u16 {
+    let args_file = PathBuf::from(
+        std::env::var("OPENSHELL_E2E_GATEWAY_ARGS_FILE")
+            .expect("owned gateway args file required"),
+    );
+    let raw = fs::read(&args_file).expect("read gateway args file");
+    let args: Vec<String> = raw
+        .split(|byte| *byte == 0)
+        .filter(|arg| !arg.is_empty())
+        .map(|arg| String::from_utf8(arg.to_vec()).expect("gateway args must be UTF-8"))
+        .collect();
+    let index = args
+        .iter()
+        .position(|arg| arg == "--port")
+        .expect("gateway --port argument required");
+    args.get(index + 1)
+        .expect("gateway --port value required")
+        .parse::<u16>()
+        .expect("gateway port must be numeric")
 }
 
-impl PausedGateway {
-    fn pause(pid: u32) -> Self {
-        assert!(pid > 1, "owned test gateway PID required");
-        assert!(Command::new("kill").args(["-STOP", &pid.to_string()]).status().unwrap().success());
-        Self { pid, paused: true }
-    }
-
-    fn resume(&mut self) {
-        assert!(Command::new("kill").args(["-CONT", &self.pid.to_string()]).status().unwrap().success());
-        self.paused = false;
-    }
+fn gateway_sockets(port: u16) -> String {
+    let filter = format!("sport = :{port}");
+    let out = Command::new("ss")
+        .args(["-tnp", "state", "established", &filter])
+        .output()
+        .expect("inspect gateway TCP sockets");
+    assert!(
+        out.status.success(),
+        "ss gateway socket inspection failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
-impl Drop for PausedGateway {
-    fn drop(&mut self) {
-        if self.paused {
-            let _ = Command::new("kill").args(["-CONT", &self.pid.to_string()]).status();
-        }
-    }
+fn reset_gateway_transports(port: u16) -> String {
+    let filter = format!("sport = :{port}");
+    let out = Command::new("sudo")
+        .args(["ss", "-K", "state", "established", &filter])
+        .output()
+        .expect("reset gateway TCP transports");
+    assert!(
+        out.status.success(),
+        "ss -K gateway transport reset failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    format!(
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
 }
 
 fn companion(name: &str) -> Value {
@@ -266,29 +294,42 @@ network_policies:
     let initial = exercise(&sandbox, &fixtures, "initial", &output, None).await;
 
     let _gateway = ManagedGateway::from_env().unwrap().expect("owned gateway required for reconnect test");
-    // Gateway startup deliberately replaces the Docker supervisor. Pause the
-    // existing gateway instead, and observe the real HTTP/2 transport timeout
-    // before resuming it. Elapsed time alone is not reconnect evidence.
+    // SIGSTOP only stalls an established TCP session; it does not make the
+    // supervisor observe a transport failure. Keep the exact same gateway
+    // process alive and destroy only its established TCP sockets instead.
+    // This produces a real connection reset while preserving gateway process
+    // identity, supervisor container identity, and the durable evidence volume.
     let gateway_pid_file = PathBuf::from(std::env::var("OPENSHELL_E2E_GATEWAY_PID_FILE").unwrap());
     let gateway_pid = fs::read_to_string(&gateway_pid_file).unwrap();
     let gateway_pid = gateway_pid.trim().parse::<u32>().expect("owned gateway PID");
+    assert!(gateway_pid > 1, "owned gateway PID required");
+    let gateway_port = gateway_port_from_args();
     let supervisor_id = initial_info["Id"].as_str().unwrap();
     let before_logs = supervisor_logs(supervisor_id);
     let before_failures = session_failures(&before_logs);
     let reconnect_dir = output.join("gateway_reconnect");
     fs::create_dir_all(&reconnect_dir).unwrap();
-    fs::write(reconnect_dir.join("before-pause.log"), &before_logs).unwrap();
-    let mut paused = PausedGateway::pause(gateway_pid);
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
-    let paused_failures = loop {
+    fs::write(reconnect_dir.join("before-reset.log"), &before_logs).unwrap();
+    let sockets_before = gateway_sockets(gateway_port);
+    fs::write(reconnect_dir.join("sockets-before.txt"), &sockets_before).unwrap();
+    assert!(
+        sockets_before.lines().skip(1).any(|line| !line.trim().is_empty()),
+        "no established gateway transport found before reset: {sockets_before}"
+    );
+    let reset_output = reset_gateway_transports(gateway_port);
+    fs::write(reconnect_dir.join("transport-reset.txt"), &reset_output).unwrap();
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
+    let reset_failures = loop {
         let log = supervisor_logs(supervisor_id);
         let count = session_failures(&log);
-        fs::write(reconnect_dir.join("while-paused.log"), &log).unwrap();
+        fs::write(reconnect_dir.join("after-reset.log"), &log).unwrap();
         if count > before_failures { break count; }
-        assert!(tokio::time::Instant::now() < deadline, "no observed supervisor transport failure while gateway paused");
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "no observed supervisor transport failure after TCP reset"
+        );
+        tokio::time::sleep(Duration::from_millis(500)).await;
     };
-    paused.resume();
     wait_for_healthy(Duration::from_secs(120)).await.unwrap();
     ready(&sandbox).await;
     let reconnected = exercise(&sandbox, &fixtures, "gateway_reconnect", &output, Some(&initial)).await;
@@ -297,8 +338,9 @@ network_policies:
     assert_eq!(evidence_mount(&companion(&sandbox.name)), volume);
     assert_eq!(fs::read(output.join("initial/permits.jsonl.lock")).unwrap(), fs::read(reconnect_dir.join("permits.jsonl.lock")).unwrap(), "transport reconnect must preserve the writer token");
     fs::write(reconnect_dir.join("transport-transition.json"), serde_json::to_vec_pretty(&json!({
-        "gateway_pid":gateway_pid, "signal_sequence":["SIGSTOP","SIGCONT"],
-        "session_failures_before":before_failures, "session_failures_while_paused":paused_failures,
+        "gateway_pid":gateway_pid, "gateway_port":gateway_port,
+        "fault_injection":"tcp_socket_reset_via_ss_kill",
+        "session_failures_before":before_failures, "session_failures_after_reset":reset_failures,
         "supervisor_id":supervisor_id, "supervisor_replaced":false,
         "writer_replaced":false, "accepted_session_changed":true,
     })).unwrap()).unwrap();
