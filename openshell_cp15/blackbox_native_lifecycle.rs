@@ -31,8 +31,18 @@ fn supervisor_logs(id: &str) -> String {
     format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
 }
 
-fn session_failures(log: &str) -> usize {
-    log.lines().filter(|line| line.contains("supervisor session failed, reconnecting")).count()
+fn gateway_log() -> String {
+    let path = PathBuf::from(
+        std::env::var("OPENSHELL_E2E_GATEWAY_LOG")
+            .expect("owned gateway log required"),
+    );
+    fs::read_to_string(path).expect("read gateway log")
+}
+
+fn accepted_supervisor_sessions(log: &str) -> usize {
+    log.lines()
+        .filter(|line| line.contains("supervisor session: accepted"))
+        .count()
 }
 
 fn gateway_port_from_args() -> u16 {
@@ -306,10 +316,12 @@ network_policies:
     let gateway_port = gateway_port_from_args();
     let supervisor_id = initial_info["Id"].as_str().unwrap();
     let before_logs = supervisor_logs(supervisor_id);
-    let before_failures = session_failures(&before_logs);
+    let gateway_before = gateway_log();
+    let accepted_before = accepted_supervisor_sessions(&gateway_before);
     let reconnect_dir = output.join("gateway_reconnect");
     fs::create_dir_all(&reconnect_dir).unwrap();
-    fs::write(reconnect_dir.join("before-reset.log"), &before_logs).unwrap();
+    fs::write(reconnect_dir.join("before-reset-supervisor.log"), &before_logs).unwrap();
+    fs::write(reconnect_dir.join("gateway-before-reset.log"), &gateway_before).unwrap();
     let sockets_before = gateway_sockets(gateway_port);
     fs::write(reconnect_dir.join("sockets-before.txt"), &sockets_before).unwrap();
     assert!(
@@ -319,19 +331,23 @@ network_policies:
     let reset_output = reset_gateway_transports(gateway_port);
     fs::write(reconnect_dir.join("transport-reset.txt"), &reset_output).unwrap();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(45);
-    let reset_failures = loop {
-        let log = supervisor_logs(supervisor_id);
-        let count = session_failures(&log);
-        fs::write(reconnect_dir.join("after-reset.log"), &log).unwrap();
-        if count > before_failures { break count; }
+    let accepted_after = loop {
+        let log = gateway_log();
+        let count = accepted_supervisor_sessions(&log);
+        fs::write(reconnect_dir.join("gateway-after-reset.log"), &log).unwrap();
+        if count > accepted_before { break count; }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "no observed supervisor transport failure after TCP reset"
+            "gateway did not accept a replacement supervisor session after TCP reset"
         );
         tokio::time::sleep(Duration::from_millis(500)).await;
     };
     wait_for_healthy(Duration::from_secs(120)).await.unwrap();
     ready(&sandbox).await;
+    fs::write(
+        reconnect_dir.join("after-reset-supervisor.log"),
+        supervisor_logs(supervisor_id),
+    ).unwrap();
     let reconnected = exercise(&sandbox, &fixtures, "gateway_reconnect", &output, Some(&initial)).await;
     assert_ne!(session(&initial), session(&reconnected), "new accepted session required");
     assert_eq!(initial_info["Id"], companion(&sandbox.name)["Id"], "gateway reconnect must preserve supervisor process");
@@ -340,7 +356,8 @@ network_policies:
     fs::write(reconnect_dir.join("transport-transition.json"), serde_json::to_vec_pretty(&json!({
         "gateway_pid":gateway_pid, "gateway_port":gateway_port,
         "fault_injection":"tcp_socket_reset_via_ss_kill",
-        "session_failures_before":before_failures, "session_failures_after_reset":reset_failures,
+        "gateway_accepted_sessions_before":accepted_before,
+        "gateway_accepted_sessions_after_reset":accepted_after,
         "supervisor_id":supervisor_id, "supervisor_replaced":false,
         "writer_replaced":false, "accepted_session_changed":true,
     })).unwrap()).unwrap();
