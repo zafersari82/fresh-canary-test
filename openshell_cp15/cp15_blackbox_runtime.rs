@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 //! BLACKBOX ACV CP15 live Docker lifecycle test.
 //!
-//! Exercises three real OpenShell egress dial families through a live gateway,
-//! supervisor container, sandbox and receiver fixtures, then reads the durable
-//! evidence from the still-running supervisor before sandbox cleanup.
+//! Exercises the Docker runtime's real transparent egress lifecycle through a
+//! live gateway, supervisor companion, sandbox and receiver fixtures, then
+//! reads durable evidence from the still-running supervisor before cleanup.
+//!
+//! Explicit CONNECT and forward-proxy adapter coverage are deliberately not
+//! claimed here because Docker sandbox workloads use transparent interception.
 
 #![cfg(feature = "e2e-docker")]
 
@@ -18,8 +21,6 @@ use tempfile::NamedTempFile;
 
 const HTTP_HOST: &str = "cp15-forward.openshell.test";
 const HTTP_PORT: u16 = 8000;
-const CONNECT_HOST: &str = "cp15-connect.openshell.test";
-const CONNECT_PORT: u16 = 9443;
 const TCP_HOST: &str = "cp15-tcp.openshell.test";
 const TCP_PORT: u16 = 5432;
 
@@ -68,10 +69,6 @@ network_policies:
           - allow:
               method: GET
               path: /allowed
-{PRIVATE_ALLOWED_IPS}
-      - host: {CONNECT_HOST}
-        port: {CONNECT_PORT}
-        tls: skip
 {PRIVATE_ALLOWED_IPS}
       - host: {TCP_HOST}
         port: {TCP_PORT}
@@ -140,21 +137,39 @@ fn verify_evidence(journal: &str, witness: &str) {
         .map(|line| serde_json::from_str::<Value>(line).expect("parse journal record"))
         .collect::<Vec<_>>();
     assert!(
-        records.len() >= 3,
-        "expected at least three live runtime permits, got {}: {journal}",
+        records.len() >= 2,
+        "expected at least two live runtime permits, got {}: {journal}",
         records.len()
+    );
+
+    let matching = records
+        .iter()
+        .filter(|record| {
+            record.get("surface").and_then(Value::as_str) == Some("transparent_tcp")
+                && matches!(
+                    (
+                        record.get("host").and_then(Value::as_str),
+                        record.get("port").and_then(Value::as_u64)
+                    ),
+                    (Some(HTTP_HOST), Some(port)) if port == u64::from(HTTP_PORT)
+                        | (Some(TCP_HOST), Some(port)) if port == u64::from(TCP_PORT)
+                )
+        })
+        .count();
+    assert!(
+        matching >= 2,
+        "live Docker lifecycle must evidence transparent HTTP and TCP destinations; journal={journal}"
     );
 
     let surfaces = records
         .iter()
         .filter_map(|record| record.get("surface").and_then(Value::as_str))
         .collect::<BTreeSet<_>>();
-    for expected in ["connect", "forward_http", "transparent_tcp"] {
-        assert!(
-            surfaces.contains(expected),
-            "missing CP15 surface {expected}; observed {surfaces:?}; journal={journal}"
-        );
-    }
+    assert_eq!(
+        surfaces,
+        BTreeSet::from(["transparent_tcp"]),
+        "CP15 Docker lifecycle must report only the runtime surface actually exercised"
+    );
 
     let mut previous_hash =
         "0000000000000000000000000000000000000000000000000000000000000000".to_string();
@@ -186,7 +201,7 @@ fn verify_evidence(journal: &str, witness: &str) {
 }
 
 #[tokio::test]
-async fn live_supervisor_lifecycle_emits_all_three_durable_surfaces() {
+async fn live_docker_supervisor_lifecycle_emits_durable_transparent_evidence() {
     assert_eq!(
         std::env::var("OPENSHELL_E2E_DRIVER").as_deref(),
         Ok("docker"),
@@ -211,22 +226,6 @@ class Handler(BaseHTTPRequestHandler):
 HTTPServer(("0.0.0.0", 8000), Handler).serve_forever()
 "#;
 
-    const CONNECT_ECHO: &str = r#"
-import socket
-s = socket.socket()
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(("0.0.0.0", 9443))
-s.listen()
-while True:
-    c, _ = s.accept()
-    try:
-        data = c.recv(4096)
-        if data:
-            c.sendall(data)
-    finally:
-        c.close()
-"#;
-
     const TCP_ECHO: &str = r#"
 import socket
 s = socket.socket()
@@ -245,10 +244,7 @@ while True:
 
     let _http = SupportContainer::start_python(HTTP_HOST, HTTP_SERVER, HTTP_PORT)
         .await
-        .expect("start CP15 forward HTTP fixture");
-    let _connect = SupportContainer::start_python(CONNECT_HOST, CONNECT_ECHO, CONNECT_PORT)
-        .await
-        .expect("start CP15 CONNECT fixture");
+        .expect("start CP15 transparent HTTP fixture");
     let _tcp = SupportContainer::start_python(TCP_HOST, TCP_ECHO, TCP_PORT)
         .await
         .expect("start CP15 transparent TCP fixture");
@@ -268,61 +264,14 @@ while True:
 import urllib.request
 body = urllib.request.urlopen("http://{HTTP_HOST}:{HTTP_PORT}/allowed", timeout=15).read()
 assert body == b"cp15-forward-ok", body
-print("CP15_FORWARD_OK")
+print("CP15_TRANSPARENT_HTTP_OK")
 "#
     );
     let forward = sandbox
         .exec(&["python3", "-c", &forward_script])
         .await
-        .expect("exercise live forward HTTP path");
+        .expect("exercise live transparent HTTP path");
     assert!(forward.contains("CP15_FORWARD_OK"), "{forward}");
-
-    let connect_script = format!(
-        r#"
-import os, socket
-from urllib.parse import urlparse
-
-proxy = (
-    os.environ.get("HTTPS_PROXY")
-    or os.environ.get("https_proxy")
-    or os.environ.get("HTTP_PROXY")
-    or os.environ.get("http_proxy")
-)
-if not proxy:
-    raise RuntimeError("OpenShell proxy environment is absent")
-if "://" not in proxy:
-    proxy = "http://" + proxy
-parsed = urlparse(proxy)
-port = parsed.port or 80
-with socket.create_connection((parsed.hostname, port), timeout=15) as sock:
-    target = "{CONNECT_HOST}:{CONNECT_PORT}"
-    request = (
-        f"CONNECT {{target}} HTTP/1.1\r\n"
-        f"Host: {{target}}\r\n"
-        "Proxy-Connection: keep-alive\r\n\r\n"
-    ).encode()
-    sock.sendall(request)
-    response = b""
-    while b"\r\n\r\n" not in response:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        response += chunk
-    if b" 200 " not in response.split(b"\r\n", 1)[0]:
-        raise RuntimeError(f"CONNECT failed: {{response!r}}")
-    payload = b"cp15-connect"
-    sock.sendall(payload)
-    echoed = sock.recv(len(payload))
-    if echoed != payload:
-        raise RuntimeError(f"CONNECT echo mismatch: {{echoed!r}}")
-print("CP15_CONNECT_OK")
-"#
-    );
-    let connect = sandbox
-        .exec(&["python3", "-c", &connect_script])
-        .await
-        .expect("exercise live explicit CONNECT path");
-    assert!(connect.contains("CP15_CONNECT_OK"), "{connect}");
 
     let transparent_script = format!(
         r#"
