@@ -1,0 +1,115 @@
+name: CP15 native lifecycle (full acceptance pending)
+
+on:
+  push:
+    branches: [cp15-native-boundary-lifecycle]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  lifecycle:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CONTAINER_ENGINE: docker
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      RUSTUP_TOOLCHAIN: 1.95.0
+      OPENSHELL_CP15_DURABLE_EVIDENCE: "1"
+      OPENSHELL_DOCKER_SUPERVISOR_IMAGE: openshell/supervisor:dev
+      OPENSHELL_DOCKER_SANDBOX_RUNTIME_IMAGE: openshell/sandbox:dev
+    steps:
+      - uses: actions/checkout@v4
+      - name: Exact source and toolchain
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/harness-commit.txt
+          git clone --filter=blob:none https://github.com/NVIDIA/OpenShell.git upstream
+          git -C upstream checkout --detach 484f0768fc6a0d93e0a2be295c1679aed24e18a9
+          git -C upstream rev-parse HEAD > evidence/upstream-commit.txt
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt --target x86_64-unknown-linux-musl
+          rustc --version > evidence/rust-version.txt
+          sudo apt-get update -qq
+          sudo apt-get install -y musl-tools libclang-dev libssl-dev pkg-config cmake
+      - name: Restore build cache
+        id: build-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            upstream/target
+            upstream/e2e/rust/target
+          key: cp15-1.95-debug-v1-${{ hashFiles('openshell_cp10/**', 'openshell_cp15/**') }}
+          restore-keys: cp15-1.95-debug-v1-
+      - name: Apply exact integration and verify parser controls
+        run: |
+          python3 -m unittest discover -s openshell_cp15 -p 'test_*.py' 2>&1 | tee evidence/python-controls.txt
+          python3 openshell_cp15/apply_cp15.py upstream
+          cd upstream
+          cargo fmt --all
+          cargo fmt --manifest-path e2e/rust/Cargo.toml
+          git diff --check
+      - name: Observe stale dispatch negative control then apply fix
+        working-directory: upstream
+        run: |
+          set +e
+          cargo test -p openshell-supervisor-network cp15_new_writer_blocks_previously_committed_stale_dispatch --lib -- --nocapture > ../evidence/stale-dispatch-red.txt 2>&1
+          red_status=$?
+          set -e
+          test "$red_status" -ne 0
+          grep -q 'CP15_STALE_DISPATCH' ../evidence/stale-dispatch-red.txt
+          python3 ../openshell_cp15/apply_writer_dispatch_fix.py .
+          cargo fmt --all
+          git add -N crates/openshell-supervisor-network/src/durable_egress.rs e2e/rust/tests/blackbox_lifecycle.rs e2e/rust/tests/blackbox_native_lifecycle.rs
+          git add -N -f deploy/docker/.build/prebuilt-binaries/blackbox-state/CP15_STORAGE
+          git diff --binary > ../evidence/CP15_OPENSHELL_PINNED.patch
+          sha256sum crates/openshell-supervisor-network/src/durable_egress.rs e2e/rust/tests/blackbox_native_lifecycle.rs > ../evidence/source-hashes.txt
+      - name: CP12 to CP14 real-process regressions
+        working-directory: upstream
+        run: cargo test -p openshell-supervisor-network durable_egress --lib -- --nocapture 2>&1 | tee ../evidence/rust-regressions.txt
+      - name: Build actual supervisor and static sandbox
+        working-directory: upstream
+        run: |
+          cargo build -p openshell-supervisor --bin openshell-supervisor
+          cargo build --target x86_64-unknown-linux-musl -p openshell-sandbox --bin openshell-sandbox
+          mkdir -p deploy/docker/.build/prebuilt-binaries/amd64
+          cp target/debug/openshell-supervisor deploy/docker/.build/prebuilt-binaries/amd64/
+          cp target/x86_64-unknown-linux-musl/debug/openshell-sandbox deploy/docker/.build/prebuilt-binaries/amd64/
+          install -m 0555 "$(gcc -print-file-name=libgcc_s.so.1)" deploy/docker/.build/prebuilt-binaries/amd64/libgcc_s.so.1
+          ldd target/debug/openshell-supervisor > ../evidence/supervisor-shared-libraries.txt
+          sha256sum deploy/docker/.build/prebuilt-binaries/amd64/* > ../evidence/runtime-binary-hashes.txt
+          file deploy/docker/.build/prebuilt-binaries/amd64/* > ../evidence/runtime-binary-types.txt
+      - name: Preserve completed builds before runtime validation
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            upstream/target
+            upstream/e2e/rust/target
+          key: cp15-1.95-debug-v1-${{ hashFiles('openshell_cp10/**', 'openshell_cp15/**') }}
+      - name: Scoped native gateway supervisor sandbox lifecycle
+        working-directory: upstream
+        env:
+          CP15_VERIFIER: ${{ github.workspace }}/openshell_cp15/evidence.py
+          CP15_EVIDENCE_DIR: ${{ github.workspace }}/evidence/runtime
+        run: |
+          docker version > ../evidence/docker-version.txt
+          bash tasks/scripts/docker-build-image.sh supervisor
+          docker run --rm --network none --user 65534:65534 --read-only --cap-drop ALL --security-opt no-new-privileges openshell/supervisor:dev --help > ../evidence/supervisor-image-smoke.txt
+          bash e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test blackbox_native_lifecycle -- --nocapture 2>&1 | tee ../evidence/runtime-log.txt
+          test -s ../evidence/runtime/runtime-result.json
+          python3 -c 'import json; p=json.load(open("../evidence/runtime/runtime-result.json")); assert p["status"]=="NATIVE_LIFECYCLE_VERIFIED"; assert p["overall_cp15_acceptance"] is False'
+      - name: Preserve raw evidence even on failure
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cp15-native-lifecycle-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error

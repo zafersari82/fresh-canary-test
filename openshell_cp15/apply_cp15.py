@@ -76,6 +76,8 @@ def main():
                     'ENTRYPOINT ["/openshell-supervisor"]')
     p.write_text(s)
     (root/'e2e/rust/tests/blackbox_lifecycle.rs').write_text((HERE/'blackbox_lifecycle.rs').read_text())
+    if (HERE/'blackbox_native_lifecycle.rs').exists():
+        (root/'e2e/rust/tests/blackbox_native_lifecycle.rs').write_text((HERE/'blackbox_native_lifecycle.rs').read_text())
     print('CP15 applied to exact source pin; live validation still required')
 
 
