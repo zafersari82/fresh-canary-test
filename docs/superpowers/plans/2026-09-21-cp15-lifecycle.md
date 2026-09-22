@@ -46,7 +46,7 @@
 
 - [ ] Assert the supervisor evidence mount is a writable Docker volume and absent from the workload; the current tmpfs-based integration fails this requirement.
 - [ ] Create a stable sandbox-specific evidence volume, initialize ownership in the supervisor image, and pass journal/witness paths only to that companion.
-- [ ] Exercise one unique challenge per path before reconnect, after gateway reconnect, after stop/start and after SIGKILL recovery. Use real SandboxGuard and ManagedGateway controls.
+- [ ] Exercise one unique challenge per path before reconnect, after an observed HTTP/2 timeout during gateway SIGSTOP/SIGCONT, after stop/start and after forced stop/start of a frozen supervisor. Use the real SandboxGuard and the wrapper-owned gateway PID. A gateway restart replaces the supervisor in this pinned Docker driver and cannot represent same-process reconnect.
 - [ ] Validate every snapshot with Task 1, checking identity, unique operation IDs, exact prefix preservation, new sessions and replacement writer tokens.
 - [ ] Reject missing Docker and absent markers. Copy files using Docker's archive API (`docker cp`); the distroless supervisor has no `cat` executable.
 

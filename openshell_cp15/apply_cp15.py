@@ -70,7 +70,10 @@ def main():
     (directory/'CP15_STORAGE').write_text('Experimental durable supervisor evidence. Not a remote witness.\n')
     p = root/'deploy/docker/Dockerfile.supervisor'
     s = replace_once(p.read_text(), 'ENTRYPOINT ["/openshell-supervisor"]',
-                    'COPY --chown=65534:65534 --chmod=0700 deploy/docker/.build/prebuilt-binaries/blackbox-state/ /var/lib/blackbox-acv/\n\nENTRYPOINT ["/openshell-supervisor"]')
+                    'COPY --chown=65534:65534 --chmod=0700 deploy/docker/.build/prebuilt-binaries/blackbox-state/ /var/lib/blackbox-acv/\n'
+                    '# CP15 uses a native GNU CI build, whose unwind runtime is not in base-nossl.\n'
+                    'COPY --chmod=0555 deploy/docker/.build/prebuilt-binaries/${TARGETARCH}/libgcc_s.so.1 /lib/libgcc_s.so.1\n\n'
+                    'ENTRYPOINT ["/openshell-supervisor"]')
     p.write_text(s)
     (root/'e2e/rust/tests/blackbox_lifecycle.rs').write_text((HERE/'blackbox_lifecycle.rs').read_text())
     print('CP15 applied to exact source pin; live validation still required')

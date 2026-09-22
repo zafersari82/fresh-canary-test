@@ -25,6 +25,42 @@ fn docker(args: &[&str]) -> String {
     String::from_utf8(out.stdout).expect("UTF-8 Docker output").trim().to_string()
 }
 
+fn supervisor_logs(id: &str) -> String {
+    let out = Command::new("docker").args(["logs", id]).output().unwrap();
+    assert!(out.status.success(), "read supervisor logs: {}", String::from_utf8_lossy(&out.stderr));
+    format!("{}\n{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+}
+
+fn session_failures(log: &str) -> usize {
+    log.lines().filter(|line| line.contains("supervisor session failed, reconnecting")).count()
+}
+
+struct PausedGateway {
+    pid: u32,
+    paused: bool,
+}
+
+impl PausedGateway {
+    fn pause(pid: u32) -> Self {
+        assert!(pid > 1, "owned test gateway PID required");
+        assert!(Command::new("kill").args(["-STOP", &pid.to_string()]).status().unwrap().success());
+        Self { pid, paused: true }
+    }
+
+    fn resume(&mut self) {
+        assert!(Command::new("kill").args(["-CONT", &self.pid.to_string()]).status().unwrap().success());
+        self.paused = false;
+    }
+}
+
+impl Drop for PausedGateway {
+    fn drop(&mut self) {
+        if self.paused {
+            let _ = Command::new("kill").args(["-CONT", &self.pid.to_string()]).status();
+        }
+    }
+}
+
 fn companion(name: &str) -> Value {
     let filter = format!("label=openshell.ai/sandbox-name={name}");
     let ids = docker(&["ps", "-q", "--filter", &filter, "--filter", "label=openshell.ai/isolation-role=supervisor"]);
@@ -247,21 +283,43 @@ network_policies:
     assert!(workload[0]["Mounts"].as_array().unwrap().iter().all(|m| m["Name"] != volume && m["Destination"] != STATE), "workload must not mount evidence");
     let initial = exercise(&sandbox, &fixtures, "initial", &output, None).await;
 
-    let gateway = ManagedGateway::from_env().unwrap().expect("owned gateway required for reconnect test");
-    // Graceful gateway shutdown deliberately stops its sandboxes. A killed
-    // gateway exercises reconnect while keeping the existing supervisor alive.
+    let _gateway = ManagedGateway::from_env().unwrap().expect("owned gateway required for reconnect test");
+    // Gateway startup deliberately replaces the Docker supervisor. Pause the
+    // existing gateway instead, and observe the real HTTP/2 transport timeout
+    // before resuming it. Elapsed time alone is not reconnect evidence.
     let gateway_pid_file = PathBuf::from(std::env::var("OPENSHELL_E2E_GATEWAY_PID_FILE").unwrap());
     let gateway_pid = fs::read_to_string(&gateway_pid_file).unwrap();
     let gateway_pid = gateway_pid.trim().parse::<u32>().expect("owned gateway PID");
-    assert!(Command::new("kill").args(["-KILL", &gateway_pid.to_string()]).status().unwrap().success());
-    fs::remove_file(&gateway_pid_file).unwrap();
-    gateway.start().unwrap();
+    let supervisor_id = initial_info["Id"].as_str().unwrap();
+    let before_logs = supervisor_logs(supervisor_id);
+    let before_failures = session_failures(&before_logs);
+    let reconnect_dir = output.join("gateway_reconnect");
+    fs::create_dir_all(&reconnect_dir).unwrap();
+    fs::write(reconnect_dir.join("before-pause.log"), &before_logs).unwrap();
+    let mut paused = PausedGateway::pause(gateway_pid);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(90);
+    let paused_failures = loop {
+        let log = supervisor_logs(supervisor_id);
+        let count = session_failures(&log);
+        fs::write(reconnect_dir.join("while-paused.log"), &log).unwrap();
+        if count > before_failures { break count; }
+        assert!(tokio::time::Instant::now() < deadline, "no observed supervisor transport failure while gateway paused");
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    };
+    paused.resume();
     wait_for_healthy(Duration::from_secs(120)).await.unwrap();
     ready(&sandbox).await;
     let reconnected = exercise(&sandbox, &fixtures, "gateway_reconnect", &output, Some(&initial)).await;
     assert_ne!(session(&initial), session(&reconnected), "new accepted session required");
     assert_eq!(initial_info["Id"], companion(&sandbox.name)["Id"], "gateway reconnect must preserve supervisor process");
     assert_eq!(evidence_mount(&companion(&sandbox.name)), volume);
+    assert_eq!(fs::read(output.join("initial/permits.jsonl.lock")).unwrap(), fs::read(reconnect_dir.join("permits.jsonl.lock")).unwrap(), "transport reconnect must preserve the writer token");
+    fs::write(reconnect_dir.join("transport-transition.json"), serde_json::to_vec_pretty(&json!({
+        "gateway_pid":gateway_pid, "signal_sequence":["SIGSTOP","SIGCONT"],
+        "session_failures_before":before_failures, "session_failures_while_paused":paused_failures,
+        "supervisor_id":supervisor_id, "supervisor_replaced":false,
+        "writer_replaced":false, "accepted_session_changed":true,
+    })).unwrap()).unwrap();
 
     let before = companion(&sandbox.name);
     lifecycle("stop", &sandbox).await;
@@ -281,6 +339,9 @@ network_policies:
     lifecycle("stop", &sandbox).await;
     lifecycle("start", &sandbox).await;
     ready(&sandbox).await;
+    let recovered_info = companion(&sandbox.name);
+    assert_ne!(after["Id"], recovered_info["Id"], "forced stop/start must replace the supervisor");
+    assert_eq!(evidence_mount(&recovered_info), volume, "forced stop/start must retain the evidence volume");
     let recovered = exercise(&sandbox, &fixtures, "forced_stop_start", &output, Some(&restarted)).await;
     assert_ne!(session(&restarted), session(&recovered));
     assert_ne!(fs::read(output.join("sandbox_restart/permits.jsonl.lock")).unwrap(), fs::read(output.join("forced_stop_start/permits.jsonl.lock")).unwrap());

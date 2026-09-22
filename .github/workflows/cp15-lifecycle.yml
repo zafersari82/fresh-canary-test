@@ -77,6 +77,8 @@ jobs:
           mkdir -p deploy/docker/.build/prebuilt-binaries/amd64
           cp target/debug/openshell-supervisor deploy/docker/.build/prebuilt-binaries/amd64/
           cp target/x86_64-unknown-linux-musl/debug/openshell-sandbox deploy/docker/.build/prebuilt-binaries/amd64/
+          install -m 0555 "$(gcc -print-file-name=libgcc_s.so.1)" deploy/docker/.build/prebuilt-binaries/amd64/libgcc_s.so.1
+          ldd target/debug/openshell-supervisor > ../evidence/supervisor-shared-libraries.txt
           sha256sum deploy/docker/.build/prebuilt-binaries/amd64/* > ../evidence/runtime-binary-hashes.txt
           file deploy/docker/.build/prebuilt-binaries/amd64/* > ../evidence/runtime-binary-types.txt
       - name: Full gateway supervisor sandbox lifecycle
@@ -86,6 +88,8 @@ jobs:
           CP15_EVIDENCE_DIR: ${{ github.workspace }}/evidence/runtime
         run: |
           docker version > ../evidence/docker-version.txt
+          bash tasks/scripts/docker-build-image.sh supervisor
+          docker run --rm --network none --user 65534:65534 --read-only --cap-drop ALL --security-opt no-new-privileges openshell/supervisor:dev --help > ../evidence/supervisor-image-smoke.txt
           bash e2e/with-docker-gateway.sh cargo test --manifest-path e2e/rust/Cargo.toml --features e2e-docker --test blackbox_lifecycle -- --nocapture 2>&1 | tee ../evidence/runtime-log.txt
           test -s ../evidence/runtime/runtime-result.json
       - name: Preserve raw evidence even on failure
