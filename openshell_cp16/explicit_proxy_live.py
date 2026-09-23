@@ -92,12 +92,32 @@ def durable_observation(
     )
     (evidence / f"{prefix}-observed-journal.jsonl").write_bytes(journal_bytes)
     (evidence / f"{prefix}-observed-witness.json").write_bytes(witness_bytes)
+    remote_state_matches = None
+    remote_state_path = os.environ.get("BLACKBOX_CP17_REMOTE_STATE_OBSERVATION")
+    if remote_state_path:
+        remote_bytes = Path(remote_state_path).read_bytes()
+        remote_document = json.loads(remote_bytes)
+        remote_state = remote_document.get("network-proxy", {})
+        remote_state_matches = (
+            remote_state.get("sequence") == record.get("sequence")
+            and remote_state.get("head_record_sha256")
+            == record.get("journal_record_sha256")
+        )
+        (evidence / f"{prefix}-observed-remote-witness-state.json").write_bytes(
+            remote_bytes
+        )
+        if not remote_state_matches:
+            raise AssertionError(
+                f"remote witness did not match {surface} record at receiver observation"
+            )
+
     result = {
         "surface": surface,
         "port": port,
         "observed_unix_ns": time.time_ns(),
         "journal_present_before_receiver_effect": True,
         "witness_head_matches_record_at_receiver_effect": witness_matches,
+        "remote_witness_state_matches_record_at_receiver_effect": remote_state_matches,
         "sequence": record.get("sequence"),
         "operation_id": record.get("operation_id"),
         "journal_record_sha256": record.get("journal_record_sha256"),
