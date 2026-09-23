@@ -83,6 +83,7 @@ jobs:
           assert p["replayed_signed_receipt_rejected"] is True
           assert p["forged_receipt_rejected"] is True
           assert p["dispatch_requires_remote_receipt_before_effect"] is True
+          assert p["receiver_time_remote_witness_proven"] is True
           assert p["overall_cp17_acceptance"] is False
           state=json.load(open("evidence/runtime/remote-witness/state.json"))
           assert state["network-proxy"]["sequence"] == 2
