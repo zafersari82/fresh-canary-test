@@ -185,6 +185,9 @@ def main() -> None:
         primary = evidence / "primary"
         env = os.environ.copy()
         env.update(remote_env)
+        env["BLACKBOX_CP17_REMOTE_STATE_OBSERVATION"] = str(
+            witness_dir / "state.json"
+        )
         subprocess.run(
             [
                 sys.executable,
@@ -211,6 +214,16 @@ def main() -> None:
             "connect",
         ]:
             raise AssertionError("primary explicit-proxy surface evidence changed")
+        for name in ("forward", "connect"):
+            observation = json.loads(
+                (primary / f"{name}-receiver-observation.json").read_text()
+            )
+            if observation.get(
+                "remote_witness_state_matches_record_at_receiver_effect"
+            ) is not True:
+                raise AssertionError(
+                    f"{name} receiver did not observe matching remote witness state"
+                )
 
         # Joint rollback: local journal AND local witness are both restored to
         # sequence 1. The independent signed witness remains at sequence 2.
@@ -295,6 +308,7 @@ def main() -> None:
             "replayed_signed_receipt_rejected": True,
             "forged_receipt_rejected": True,
             "dispatch_requires_remote_receipt_before_effect": True,
+            "receiver_time_remote_witness_proven": True,
             "negative_controls": {
                 "joint_rollback": joint_result,
                 "replay": replay_result,
