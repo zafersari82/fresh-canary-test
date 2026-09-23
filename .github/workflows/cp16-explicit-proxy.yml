@@ -1,0 +1,104 @@
+name: CP16 explicit proxy durable evidence
+
+on:
+  push:
+    branches: [cp16-explicit-proxy-durable-evidence]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  explicit-proxy:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      RUSTUP_TOOLCHAIN: 1.95.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Exact source and toolchain
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/harness-commit.txt
+          git clone --filter=blob:none https://github.com/NVIDIA/OpenShell.git upstream
+          git -C upstream checkout --detach 484f0768fc6a0d93e0a2be295c1679aed24e18a9
+          git -C upstream rev-parse HEAD > evidence/upstream-commit.txt
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc --version > evidence/rust-version.txt
+          sudo apt-get update -qq
+          sudo apt-get install -y libclang-dev libssl-dev pkg-config cmake
+
+      - name: Restore build cache
+        id: build-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            upstream/target
+          key: cp16-1.95-debug-v1-${{ hashFiles('openshell_cp10/**', 'openshell_cp15/**', 'openshell_cp16/**') }}
+          restore-keys: |
+            cp16-1.95-debug-v1-
+            cp15-1.95-debug-v1-
+
+      - name: Apply CP16 exact integration
+        run: |
+          python3 openshell_cp16/apply_cp16.py upstream
+          cd upstream
+          cargo fmt --all
+          git diff --check
+          git add -N crates/openshell-supervisor-network/src/durable_egress.rs
+          git diff --binary > ../evidence/CP16_OPENSHELL_PINNED.patch
+          sha256sum             crates/openshell-supervisor-network/src/durable_egress.rs             crates/openshell-supervisor-network/src/proxy.rs             crates/openshell-supervisor/src/lib.rs             > ../evidence/source-hashes.txt
+
+      - name: CP10 to CP15 durable regressions
+        working-directory: upstream
+        run: |
+          cargo test -p openshell-supervisor-network durable_egress --lib -- --nocapture             2>&1 | tee ../evidence/rust-regressions.txt
+
+      - name: Build actual standalone supervisor
+        working-directory: upstream
+        run: |
+          cargo build -p openshell-supervisor --bin openshell-supervisor
+          file target/debug/openshell-supervisor > ../evidence/supervisor-binary-type.txt
+          sha256sum target/debug/openshell-supervisor > ../evidence/supervisor-binary-sha256.txt
+
+      - name: Live CONNECT and forward HTTP durable evidence
+        run: |
+          python3 openshell_cp16/explicit_proxy_live.py upstream evidence/runtime             2>&1 | tee evidence/cp16-live.txt
+          python3 openshell_cp15/evidence.py             --journal evidence/runtime/final-valid-permits.jsonl             --witness evidence/runtime/final-valid-witness.json             --sandbox-id network-proxy             > evidence/verification.json
+          python3 - <<'PY'
+          import json
+          p=json.load(open("evidence/runtime/runtime-result.json"))
+          assert p["status"] == "EXPLICIT_PROXY_SURFACES_VERIFIED"
+          assert p["verified_surfaces"] == ["forward_http", "connect"]
+          assert p["causal_durable_before_receiver_observation_proven"] is True
+          assert p["journal_only_rollback_detected"] is True
+          assert p["overall_cp16_acceptance"] is False
+          v=json.load(open("evidence/verification.json"))
+          assert v["count"] == 2
+          assert [r["surface"] for r in v["records"]] == ["forward_http", "connect"]
+          PY
+
+      - name: Preserve completed build cache
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            upstream/target
+          key: cp16-1.95-debug-v1-${{ hashFiles('openshell_cp10/**', 'openshell_cp15/**', 'openshell_cp16/**') }}
+
+      - name: Preserve evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cp16-explicit-proxy-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
