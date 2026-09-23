@@ -241,6 +241,13 @@ fn reconcile_remote_witness(
 
     s = rep(
         s,
+        "let setup_result = (|| -> io::Result<(File, JournalHead)> {",
+        "let setup_result = (|| -> io::Result<(File, JournalHead, Option<RemoteWitnessState>)> {",
+        "remote-aware setup result type",
+    )
+
+    s = rep(
+        s,
         """            Ok((journal, recovery.head))
         })();
 
