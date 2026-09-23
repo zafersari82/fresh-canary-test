@@ -26,9 +26,25 @@ def json_dump(path: Path, value) -> None:
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
 
 
-def choose_port() -> int:
+def receiver_host() -> str:
+    # Select the runner's ordinary routed interface rather than loopback.
+    # OpenShell intentionally treats loopback/link-local as always blocked,
+    # even when allowed_ips is configured.
+    probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        probe.connect(("8.8.8.8", 53))
+        host = probe.getsockname()[0]
+    finally:
+        probe.close()
+    ip = ipaddress.ip_address(host)
+    if ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+        raise RuntimeError(f"receiver host is not externally mediable: {host}")
+    return host
+
+
+def choose_port(host: str = PROXY_HOST) -> int:
     s = socket.socket()
-    s.bind((HOST, 0))
+    s.bind((host, 0))
     port = s.getsockname()[1]
     s.close()
     return port
@@ -99,8 +115,10 @@ class Receiver:
         journal: Path,
         witness: Path,
         evidence: Path,
+        host: str,
     ):
         self.kind = kind
+        self.host = host
         self.journal = journal
         self.witness = witness
         self.evidence = evidence
@@ -181,7 +199,7 @@ def wait_proxy_ready(proc: subprocess.Popen, port: int) -> None:
         if proc.poll() is not None:
             raise RuntimeError(f"proxy exited before readiness with code {proc.returncode}")
         try:
-            with socket.create_connection((HOST, port), timeout=0.5):
+            with socket.create_connection((PROXY_HOST, port), timeout=0.5):
                 return
         except OSError as exc:
             last = exc
@@ -192,7 +210,7 @@ def wait_proxy_ready(proc: subprocess.Popen, port: int) -> None:
 def forward_request(proxy_port: int, receiver: Receiver) -> bytes:
     with socket.create_connection((HOST, proxy_port), timeout=10) as s:
         s.settimeout(10)
-        authority = f"{HOST}:{receiver.port}"
+        authority = f"{receiver.host}:{receiver.port}"
         req = (
             f"GET http://{authority}/cp16-forward HTTP/1.1\r\n"
             f"Host: {authority}\r\n"
@@ -249,7 +267,7 @@ def start_proxy(
     cmd = [
         str(root / "target/debug/openshell-supervisor"),
         "--role=network-proxy",
-        f"--listen={HOST}:{proxy_port}",
+        f"--listen={PROXY_HOST}:{proxy_port}",
         f"--tls-dir={tls_dir}",
         f"--policy-rules={root / 'crates/openshell-supervisor-network/data/sandbox-policy.rego'}",
         f"--policy-data={policy}",
@@ -285,8 +303,10 @@ def main() -> None:
     journal = evidence / "permits.jsonl"
     witness = evidence / "witness.json"
 
-    forward = Receiver("forward", journal, witness, evidence)
-    connect = Receiver("connect", journal, witness, evidence)
+    upstream_host = receiver_host()
+    json_dump(evidence / "runner-network.json", {"proxy_host": PROXY_HOST, "receiver_host": upstream_host})
+    forward = Receiver("forward", journal, witness, evidence, upstream_host)
+    connect = Receiver("connect", journal, witness, evidence, upstream_host)
     forward.start()
     connect.start()
 
@@ -296,14 +316,12 @@ def main() -> None:
   cp16_explicit_proxy:
     name: cp16_explicit_proxy
     endpoints:
-      - host: "{HOST}"
+      - host: "{upstream_host}"
         port: {forward.port}
         tls: skip
-        allowed_ips: ["127.0.0.1/32"]
-      - host: "{HOST}"
+      - host: "{upstream_host}"
         port: {connect.port}
         tls: skip
-        allowed_ips: ["127.0.0.1/32"]
     binaries:
       - path: "/**"
 """
