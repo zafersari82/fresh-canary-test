@@ -34,6 +34,18 @@ def main() -> None:
         check=True,
     )
 
+    # CP15 deliberately demonstrated the stale-dispatch failure before
+    # applying this second-stage fix. CP16 inherits the fixed state, not the
+    # red negative-control state.
+    subprocess.run(
+        [
+            sys.executable,
+            str(HERE.parent / "openshell_cp15" / "apply_writer_dispatch_fix.py"),
+            str(root),
+        ],
+        check=True,
+    )
+
     path = root / "crates/openshell-supervisor/src/lib.rs"
     source = path.read_text()
 
