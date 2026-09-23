@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import ipaddress
 import json
 import os
 from pathlib import Path
@@ -15,7 +16,7 @@ import threading
 import time
 import uuid
 
-HOST = "127.0.0.1"
+PROXY_HOST = "127.0.0.1"
 
 
 def sha256(data: bytes) -> str:
@@ -27,11 +28,10 @@ def json_dump(path: Path, value) -> None:
 
 
 def receiver_host() -> str:
-    # Select the runner's ordinary routed interface rather than loopback.
-    # OpenShell intentionally treats loopback/link-local as always blocked,
-    # even when allowed_ips is configured.
+    """Return the runner's ordinary routed IPv4 address, never loopback."""
     probe = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     try:
+        # UDP connect selects an interface without sending application data.
         probe.connect(("8.8.8.8", 53))
         host = probe.getsockname()[0]
     finally:
@@ -44,10 +44,11 @@ def receiver_host() -> str:
 
 def choose_port(host: str = PROXY_HOST) -> int:
     s = socket.socket()
-    s.bind((host, 0))
-    port = s.getsockname()[1]
-    s.close()
-    return port
+    try:
+        s.bind((host, 0))
+        return s.getsockname()[1]
+    finally:
+        s.close()
 
 
 def recv_until(sock: socket.socket, marker: bytes, limit: int = 1 << 20) -> bytes:
@@ -86,7 +87,8 @@ def durable_observation(
     witness_obj = json.loads(witness_bytes)
     witness_matches = (
         witness_obj.get("sequence") == record.get("sequence")
-        and witness_obj.get("head_record_sha256") == record.get("journal_record_sha256")
+        and witness_obj.get("head_record_sha256")
+        == record.get("journal_record_sha256")
     )
     (evidence / f"{prefix}-observed-journal.jsonl").write_bytes(journal_bytes)
     (evidence / f"{prefix}-observed-witness.json").write_bytes(witness_bytes)
@@ -103,7 +105,9 @@ def durable_observation(
         "witness_snapshot_sha256": sha256(witness_bytes),
     }
     if not witness_matches:
-        raise AssertionError(f"witness did not match {surface} record at receiver observation")
+        raise AssertionError(
+            f"witness did not match {surface} record at receiver observation"
+        )
     json_dump(evidence / f"{prefix}-receiver-observation.json", result)
     return result
 
@@ -124,7 +128,7 @@ class Receiver:
         self.evidence = evidence
         self.sock = socket.socket()
         self.sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.sock.bind((HOST, 0))
+        self.sock.bind((host, 0))
         self.sock.listen(4)
         self.port = self.sock.getsockname()[1]
         self.challenge = f"cp16-{kind}-{uuid.uuid4()}"
@@ -148,8 +152,10 @@ class Receiver:
             with conn:
                 conn.settimeout(10)
                 surface = "forward_http" if self.kind == "forward" else "connect"
-                # This observation happens immediately after the upstream TCP
-                # side effect becomes visible to the receiver.
+
+                # This executes immediately after the receiver can observe the
+                # upstream TCP side effect. The journal and high-water witness
+                # therefore must already be durable/readable at this point.
                 self.observation = durable_observation(
                     self.journal,
                     self.witness,
@@ -158,6 +164,7 @@ class Receiver:
                     self.evidence,
                     self.kind,
                 )
+
                 if self.kind == "forward":
                     raw = recv_until(conn, b"\r\n\r\n")
                     text = raw.decode("latin1")
@@ -177,6 +184,7 @@ class Receiver:
                     if line.decode().strip() != self.challenge:
                         raise AssertionError(f"CONNECT payload mismatch: {line!r}")
                     conn.sendall((self.challenge + "\n").encode())
+
                 json_dump(
                     self.evidence / f"{self.kind}-receiver-result.json",
                     {
@@ -197,7 +205,9 @@ def wait_proxy_ready(proc: subprocess.Popen, port: int) -> None:
     last = None
     while time.time() < deadline:
         if proc.poll() is not None:
-            raise RuntimeError(f"proxy exited before readiness with code {proc.returncode}")
+            raise RuntimeError(
+                f"proxy exited before readiness with code {proc.returncode}"
+            )
         try:
             with socket.create_connection((PROXY_HOST, port), timeout=0.5):
                 return
@@ -208,7 +218,7 @@ def wait_proxy_ready(proc: subprocess.Popen, port: int) -> None:
 
 
 def forward_request(proxy_port: int, receiver: Receiver) -> bytes:
-    with socket.create_connection((HOST, proxy_port), timeout=10) as s:
+    with socket.create_connection((PROXY_HOST, proxy_port), timeout=10) as s:
         s.settimeout(10)
         authority = f"{receiver.host}:{receiver.port}"
         req = (
@@ -225,14 +235,16 @@ def forward_request(proxy_port: int, receiver: Receiver) -> bytes:
                 break
             response.extend(chunk)
     if b"200 OK" not in response or receiver.challenge.encode() not in response:
-        raise AssertionError(f"forward proxy response invalid: {bytes(response)!r}")
+        raise AssertionError(
+            f"forward proxy response invalid: {bytes(response)!r}"
+        )
     return bytes(response)
 
 
 def connect_request(proxy_port: int, receiver: Receiver) -> bytes:
-    with socket.create_connection((HOST, proxy_port), timeout=10) as s:
+    with socket.create_connection((PROXY_HOST, proxy_port), timeout=10) as s:
         s.settimeout(10)
-        authority = f"{HOST}:{receiver.port}"
+        authority = f"{receiver.host}:{receiver.port}"
         s.sendall(
             (
                 f"CONNECT {authority} HTTP/1.1\r\n"
@@ -269,7 +281,10 @@ def start_proxy(
         "--role=network-proxy",
         f"--listen={PROXY_HOST}:{proxy_port}",
         f"--tls-dir={tls_dir}",
-        f"--policy-rules={root / 'crates/openshell-supervisor-network/data/sandbox-policy.rego'}",
+        (
+            "--policy-rules="
+            + str(root / "crates/openshell-supervisor-network/data/sandbox-policy.rego")
+        ),
         f"--policy-data={policy}",
         "--log-level=info",
     ]
@@ -296,7 +311,10 @@ def stop_proxy(proc: subprocess.Popen, log) -> None:
 
 def main() -> None:
     if len(sys.argv) != 3:
-        raise SystemExit("usage: explicit_proxy_live.py /path/to/OpenShell /path/to/evidence")
+        raise SystemExit(
+            "usage: explicit_proxy_live.py /path/to/OpenShell /path/to/evidence"
+        )
+
     root = Path(sys.argv[1]).resolve()
     evidence = Path(sys.argv[2]).resolve()
     evidence.mkdir(parents=True, exist_ok=True)
@@ -304,12 +322,19 @@ def main() -> None:
     witness = evidence / "witness.json"
 
     upstream_host = receiver_host()
-    json_dump(evidence / "runner-network.json", {"proxy_host": PROXY_HOST, "receiver_host": upstream_host})
+    json_dump(
+        evidence / "runner-network.json",
+        {"proxy_host": PROXY_HOST, "receiver_host": upstream_host},
+    )
+
     forward = Receiver("forward", journal, witness, evidence, upstream_host)
     connect = Receiver("connect", journal, witness, evidence, upstream_host)
     forward.start()
     connect.start()
 
+    # Literal non-loopback runner IPs intentionally use OpenShell's
+    # ImplicitIpLiteral destination mode. Loopback remains always blocked and
+    # is never weakened for this test.
     policy = evidence / "policy.yaml"
     policy.write_text(
         f"""network_policies:
@@ -327,7 +352,7 @@ def main() -> None:
 """
     )
 
-    proxy_port = choose_port()
+    proxy_port = choose_port(PROXY_HOST)
     proc, log = start_proxy(
         root,
         policy,
@@ -349,13 +374,19 @@ def main() -> None:
         stop_proxy(proc, log)
 
     if proc.returncode not in (0, -signal.SIGTERM):
-        raise AssertionError(f"primary proxy terminated unexpectedly: {proc.returncode}")
+        raise AssertionError(
+            f"primary proxy terminated unexpectedly: {proc.returncode}"
+        )
 
-    # Preserve the valid final state before destructive negative controls.
+    # Preserve valid final state before destructive negative controls.
     shutil.copy2(journal, evidence / "final-valid-permits.jsonl")
     shutil.copy2(witness, evidence / "final-valid-witness.json")
 
-    records = [json.loads(line) for line in journal.read_text().splitlines() if line.strip()]
+    records = [
+        json.loads(line)
+        for line in journal.read_text().splitlines()
+        if line.strip()
+    ]
     surfaces = [r.get("surface") for r in records]
     if surfaces != ["forward_http", "connect"]:
         raise AssertionError(f"unexpected durable surface sequence: {surfaces}")
@@ -368,7 +399,8 @@ def main() -> None:
     rolled_witness = rollback / "witness.json"
     rolled_journal.write_text(json.dumps(records[0], sort_keys=True) + "\n")
     shutil.copy2(witness, rolled_witness)
-    rollback_port = choose_port()
+
+    rollback_port = choose_port(PROXY_HOST)
     rollback_proc, rollback_log = start_proxy(
         root,
         policy,
@@ -383,18 +415,22 @@ def main() -> None:
         while rollback_proc.poll() is None and time.time() < deadline:
             time.sleep(0.2)
         if rollback_proc.poll() is None:
-            raise AssertionError("journal-only rollback was not rejected at startup")
+            raise AssertionError(
+                "journal-only rollback was not rejected at startup"
+            )
         if rollback_proc.returncode == 0:
-            raise AssertionError("rollback control unexpectedly exited successfully")
+            raise AssertionError(
+                "rollback control unexpectedly exited successfully"
+            )
     finally:
         stop_proxy(rollback_proc, rollback_log)
 
     observations = [forward.observation, connect.observation]
     if not all(
-        o
-        and o["journal_present_before_receiver_effect"]
-        and o["witness_head_matches_record_at_receiver_effect"]
-        for o in observations
+        observation
+        and observation["journal_present_before_receiver_effect"]
+        and observation["witness_head_matches_record_at_receiver_effect"]
+        for observation in observations
     ):
         raise AssertionError("receiver-time durable observation failed")
 
