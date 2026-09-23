@@ -1,0 +1,107 @@
+name: CP17 authenticated remote witness
+
+on:
+  push:
+    branches: [cp17-authenticated-remote-witness]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  authenticated-remote-witness:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 70
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      RUSTUP_TOOLCHAIN: 1.95.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Exact source and toolchain
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/harness-commit.txt
+          git clone --filter=blob:none https://github.com/NVIDIA/OpenShell.git upstream
+          git -C upstream checkout --detach 484f0768fc6a0d93e0a2be295c1679aed24e18a9
+          git -C upstream rev-parse HEAD > evidence/upstream-commit.txt
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc --version > evidence/rust-version.txt
+          sudo apt-get update -qq
+          sudo apt-get install -y libclang-dev libssl-dev pkg-config cmake python3-cryptography
+
+      - name: Restore build cache
+        id: build-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            upstream/target
+          key: cp17-1.95-debug-v1-${{ hashFiles('openshell_cp10/**', 'openshell_cp15/**', 'openshell_cp16/**', 'openshell_cp17/**') }}
+          restore-keys: |
+            cp17-1.95-debug-v1-
+            cp16-1.95-debug-v1-
+
+      - name: Apply CP17 exact integration
+        run: |
+          python3 openshell_cp17/apply_cp17.py upstream
+          cd upstream
+          cargo fmt --all
+          git diff --check
+          git add -N             crates/openshell-supervisor-network/src/durable_egress.rs             crates/openshell-supervisor-network/src/remote_witness.rs
+          git diff --binary > ../evidence/CP17_OPENSHELL_PINNED.patch
+          sha256sum             crates/openshell-supervisor-network/src/durable_egress.rs             crates/openshell-supervisor-network/src/remote_witness.rs             crates/openshell-supervisor-network/src/proxy.rs             crates/openshell-supervisor/src/lib.rs             > ../evidence/source-hashes.txt
+
+      - name: Durable and remote-witness regressions
+        working-directory: upstream
+        run: |
+          cargo test -p openshell-supervisor-network durable_egress --lib -- --nocapture             2>&1 | tee ../evidence/durable-regressions.txt
+          cargo test -p openshell-supervisor-network remote_witness --lib -- --nocapture             2>&1 | tee ../evidence/remote-witness-regressions.txt
+
+      - name: Build actual standalone supervisor
+        working-directory: upstream
+        run: |
+          cargo build -p openshell-supervisor --bin openshell-supervisor
+          file target/debug/openshell-supervisor > ../evidence/supervisor-binary-type.txt
+          sha256sum target/debug/openshell-supervisor > ../evidence/supervisor-binary-sha256.txt
+
+      - name: Live authenticated witness and attack controls
+        run: |
+          python3 openshell_cp17/remote_witness_live.py upstream evidence/runtime             2>&1 | tee evidence/cp17-live.txt
+          python3 - <<'PY'
+          import json
+          p=json.load(open("evidence/runtime/runtime-result.json"))
+          assert p["status"] == "AUTHENTICATED_REMOTE_WITNESS_VERIFIED"
+          assert p["remote_witness_sequence"] == 2
+          assert p["remote_receipts_ed25519_authenticated"] is True
+          assert p["receipt_freshness_nonce_bound"] is True
+          assert p["joint_local_rollback_detected"] is True
+          assert p["replayed_signed_receipt_rejected"] is True
+          assert p["forged_receipt_rejected"] is True
+          assert p["dispatch_requires_remote_receipt_before_effect"] is True
+          assert p["overall_cp17_acceptance"] is False
+          state=json.load(open("evidence/runtime/remote-witness/state.json"))
+          assert state["network-proxy"]["sequence"] == 2
+          PY
+
+      - name: Preserve completed build cache
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            upstream/target
+          key: cp17-1.95-debug-v1-${{ hashFiles('openshell_cp10/**', 'openshell_cp15/**', 'openshell_cp16/**', 'openshell_cp17/**') }}
+
+      - name: Preserve evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cp17-authenticated-remote-witness-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
