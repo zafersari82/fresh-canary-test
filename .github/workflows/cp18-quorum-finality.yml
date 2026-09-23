@@ -1,0 +1,111 @@
+name: CP18 quorum finality
+
+on:
+  push:
+    branches: [cp18-quorum-finality]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quorum-finality:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 80
+    env:
+      CARGO_BUILD_JOBS: 2
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+      CARGO_INCREMENTAL: 0
+      RUSTUP_TOOLCHAIN: 1.95.0
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Exact source and toolchain
+        run: |
+          mkdir -p evidence
+          git rev-parse HEAD > evidence/harness-commit.txt
+          git clone --filter=blob:none https://github.com/NVIDIA/OpenShell.git upstream
+          git -C upstream checkout --detach 484f0768fc6a0d93e0a2be295c1679aed24e18a9
+          git -C upstream rev-parse HEAD > evidence/upstream-commit.txt
+          rustup toolchain install 1.95.0 --profile minimal --component rustfmt
+          rustc --version > evidence/rust-version.txt
+          sudo apt-get update -qq
+          sudo apt-get install -y libclang-dev libssl-dev pkg-config cmake python3-cryptography
+
+      - name: Restore build cache
+        id: build-cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            upstream/target
+          key: cp18-1.95-debug-v1-${{ hashFiles('openshell_cp10/**', 'openshell_cp15/**', 'openshell_cp16/**', 'openshell_cp17/**', 'openshell_cp18/**') }}
+          restore-keys: |
+            cp18-1.95-debug-v1-
+            cp17-1.95-debug-v1-
+            cp16-1.95-debug-v1-
+
+      - name: Apply CP18 exact integration
+        run: |
+          python3 openshell_cp18/apply_cp18.py upstream
+          cd upstream
+          cargo fmt --all
+          git diff --check
+          git add -N             crates/openshell-supervisor-network/src/durable_egress.rs             crates/openshell-supervisor-network/src/remote_witness.rs
+          git diff --binary > ../evidence/CP18_OPENSHELL_PINNED.patch
+          sha256sum             crates/openshell-supervisor-network/src/durable_egress.rs             crates/openshell-supervisor-network/src/remote_witness.rs             crates/openshell-supervisor-network/src/proxy.rs             crates/openshell-supervisor/src/lib.rs             > ../evidence/source-hashes.txt
+
+      - name: Durable and quorum-witness regressions
+        working-directory: upstream
+        run: |
+          cargo test -p openshell-supervisor-network durable_egress --lib -- --nocapture             2>&1 | tee ../evidence/durable-regressions.txt
+          cargo test -p openshell-supervisor-network remote_witness --lib -- --nocapture             2>&1 | tee ../evidence/quorum-witness-regressions.txt
+
+      - name: Build actual standalone supervisor
+        working-directory: upstream
+        run: |
+          cargo build -p openshell-supervisor --bin openshell-supervisor
+          file target/debug/openshell-supervisor > ../evidence/supervisor-binary-type.txt
+          sha256sum target/debug/openshell-supervisor > ../evidence/supervisor-binary-sha256.txt
+
+      - name: Live 2-of-3 finality quorum and attack controls
+        run: |
+          python3 openshell_cp18/quorum_live.py upstream evidence/runtime             2>&1 | tee evidence/cp18-live.txt
+          python3 - <<'PY'
+          import json
+          p=json.load(open("evidence/runtime/runtime-result.json"))
+          assert p["status"] == "QUORUM_FINALITY_VERIFIED"
+          assert p["quorum"] == {"members": 3, "threshold": 2}
+          assert p["receiver_time_quorum_before_effect"] is True
+          assert p["one_witness_unavailable_tolerated"] is True
+          assert p["joint_local_rollback_detected"] is True
+          assert p["one_signed_fork_tolerated_with_honest_quorum"] is True
+          assert p["split_without_quorum_failed_closed"] is True
+          assert p["client_hmac_authentication_enforced"] is True
+          assert p["server_receipts_ed25519_authenticated"] is True
+          assert p["overall_cp18_acceptance"] is False
+          for name in ("forward", "connect"):
+              o=json.load(open(f"evidence/runtime/primary/{name}-receiver-observation.json"))
+              assert o["remote_quorum_matching_witnesses_at_receiver_effect"] >= 2
+              assert o["remote_quorum_required_at_receiver_effect"] == 2
+          PY
+
+      - name: Preserve completed build cache
+        if: steps.build-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            upstream/target
+          key: cp18-1.95-debug-v1-${{ hashFiles('openshell_cp10/**', 'openshell_cp15/**', 'openshell_cp16/**', 'openshell_cp17/**', 'openshell_cp18/**') }}
+
+      - name: Preserve evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: cp18-quorum-finality-${{ github.run_id }}-${{ github.run_attempt }}
+          path: evidence/
+          if-no-files-found: error
