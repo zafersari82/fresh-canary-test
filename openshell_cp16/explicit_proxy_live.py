@@ -111,6 +111,62 @@ def durable_observation(
                 f"remote witness did not match {surface} record at receiver observation"
             )
 
+    quorum_match_count = None
+    quorum_required = None
+    quorum_paths_raw = os.environ.get("BLACKBOX_CP18_REMOTE_STATE_PATHS_JSON")
+    if quorum_paths_raw:
+        quorum_paths = [Path(p) for p in json.loads(quorum_paths_raw)]
+        quorum_required = int(
+            os.environ.get("BLACKBOX_CP18_REMOTE_STATE_THRESHOLD", "2")
+        )
+        quorum_match_count = 0
+        quorum_snapshot = []
+        for index, state_path in enumerate(quorum_paths):
+            if not state_path.exists():
+                quorum_snapshot.append(
+                    {"path": str(state_path), "exists": False, "matches": False}
+                )
+                continue
+            remote_bytes = state_path.read_bytes()
+            remote_document = json.loads(remote_bytes)
+            remote_state = remote_document.get("network-proxy", {})
+            matches_record = (
+                remote_state.get("sequence") == record.get("sequence")
+                and remote_state.get("head_record_sha256")
+                == record.get("journal_record_sha256")
+            )
+            if matches_record:
+                quorum_match_count += 1
+            quorum_snapshot.append(
+                {
+                    "path": str(state_path),
+                    "exists": True,
+                    "matches": matches_record,
+                    "sequence": remote_state.get("sequence"),
+                    "head_record_sha256": remote_state.get(
+                        "head_record_sha256"
+                    ),
+                }
+            )
+            (
+                evidence
+                / f"{prefix}-observed-quorum-witness-{index + 1}.json"
+            ).write_bytes(remote_bytes)
+
+        json_dump(
+            evidence / f"{prefix}-observed-quorum-summary.json",
+            {
+                "required": quorum_required,
+                "matching": quorum_match_count,
+                "witnesses": quorum_snapshot,
+            },
+        )
+        if quorum_match_count < quorum_required:
+            raise AssertionError(
+                f"remote quorum not durable at receiver observation: "
+                f"{quorum_match_count}/{quorum_required}"
+            )
+
     result = {
         "surface": surface,
         "port": port,
@@ -118,6 +174,8 @@ def durable_observation(
         "journal_present_before_receiver_effect": True,
         "witness_head_matches_record_at_receiver_effect": witness_matches,
         "remote_witness_state_matches_record_at_receiver_effect": remote_state_matches,
+        "remote_quorum_matching_witnesses_at_receiver_effect": quorum_match_count,
+        "remote_quorum_required_at_receiver_effect": quorum_required,
         "sequence": record.get("sequence"),
         "operation_id": record.get("operation_id"),
         "journal_record_sha256": record.get("journal_record_sha256"),
